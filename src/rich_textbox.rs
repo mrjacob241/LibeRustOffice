@@ -159,6 +159,7 @@ pub struct RichTextBoxState {
     pub editor_active: bool,
     pub selection_anchor: Option<usize>,
     pub selection_focus: Option<usize>,
+    pub edit_revision: u64,
 }
 
 impl RichTextBoxState {
@@ -192,12 +193,14 @@ impl RichTextBoxState {
             editor_active: true,
             selection_anchor: None,
             selection_focus: None,
+            edit_revision: 0,
         }
     }
 
     pub fn with_embedded_image(mut self, path: impl AsRef<Path>) -> Self {
         if let Ok(image) = DocumentImage::load_from_path(path) {
             self.images.push(image);
+            self.bump_edit_revision();
             self.ensure_newline_after_embedded_image();
         }
         self
@@ -218,6 +221,7 @@ impl RichTextBoxState {
                 self.typing_style,
                 self.cursor_adjacent_paragraph_style(),
             ));
+            self.bump_edit_revision();
         }
 
         if self.chars.last().is_some_and(|entry| entry.value == '\n') {
@@ -233,6 +237,7 @@ impl RichTextBoxState {
         ));
         self.cursor_index = self.chars.len();
         self.clear_selection();
+        self.bump_edit_revision();
     }
 
     pub fn plain_text(&self) -> String {
@@ -261,6 +266,7 @@ impl RichTextBoxState {
             ),
         );
         self.cursor_index += 1;
+        self.bump_edit_revision();
     }
 
     pub fn insert_text(&mut self, text: &str) {
@@ -306,6 +312,7 @@ impl RichTextBoxState {
 
         self.cursor_index -= 1;
         self.chars.remove(self.cursor_index);
+        self.bump_edit_revision();
     }
 
     pub fn delete_forward(&mut self) {
@@ -315,10 +322,14 @@ impl RichTextBoxState {
 
         if self.cursor_index < self.chars.len() {
             self.chars.remove(self.cursor_index);
+            self.bump_edit_revision();
         }
     }
 
     pub fn clear(&mut self) {
+        if !self.chars.is_empty() {
+            self.bump_edit_revision();
+        }
         self.chars.clear();
         self.cursor_index = 0;
         self.clear_selection();
@@ -445,6 +456,7 @@ impl RichTextBoxState {
         self.chars.drain(range.clone());
         self.cursor_index = range.start;
         self.clear_selection();
+        self.bump_edit_revision();
         true
     }
 
@@ -453,7 +465,12 @@ impl RichTextBoxState {
             for entry in &mut self.chars[range] {
                 update(&mut entry.style);
             }
+            self.bump_edit_revision();
         }
+    }
+
+    fn bump_edit_revision(&mut self) {
+        self.edit_revision = self.edit_revision.wrapping_add(1);
     }
 
     fn cursor_adjacent_style(&self) -> InlineStyle {

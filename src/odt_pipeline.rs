@@ -78,7 +78,10 @@ impl Error for OdtLoadError {}
 
 #[derive(Debug)]
 pub enum OdtSaveError {
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
     ImageEncodeFailed {
         path: PathBuf,
         source: image::ImageError,
@@ -173,8 +176,8 @@ pub fn save_document_to_odt(
     chars: &[StyledChar],
     images: &[DocumentImage],
 ) -> Result<(), OdtSaveError> {
-    let path = path.as_ref();
-    let temp_dir = create_export_temp_dir(path)?;
+    let path = resolve_export_target_path(path.as_ref())?;
+    let temp_dir = create_export_temp_dir(&path)?;
     let mimetype_path = temp_dir.join("mimetype");
     let content_xml_path = temp_dir.join(CONTENT_XML_ENTRY);
     let styles_xml_path = temp_dir.join(STYLES_XML_ENTRY);
@@ -193,13 +196,13 @@ pub fn save_document_to_odt(
     write_export_file(&manifest_xml_path, export_manifest_xml(images))?;
 
     if path.exists() {
-        fs::remove_file(path).map_err(|source| OdtSaveError::Io {
-            path: path.to_path_buf(),
+        fs::remove_file(&path).map_err(|source| OdtSaveError::Io {
+            path: path.clone(),
             source,
         })?;
     }
 
-    zip_export_package(&temp_dir, path)?;
+    zip_export_package(&temp_dir, &path)?;
     let _ = fs::remove_dir_all(&temp_dir);
     Ok(())
 }
@@ -998,6 +1001,13 @@ fn encode_document_image_png(image: &DocumentImage) -> Result<Vec<u8>, OdtSaveEr
 }
 
 fn zip_export_package(temp_dir: &Path, target_path: &Path) -> Result<(), OdtSaveError> {
+    if let Some(parent_dir) = target_path.parent() {
+        fs::create_dir_all(parent_dir).map_err(|source| OdtSaveError::Io {
+            path: parent_dir.to_path_buf(),
+            source,
+        })?;
+    }
+
     let mimetype_output = Command::new("zip")
         .current_dir(temp_dir)
         .args(["-X0q"])
@@ -1750,7 +1760,9 @@ mod tests {
         let manifest_xml = export_manifest_xml(&reloaded.images);
         assert!(manifest_xml.contains("Pictures/liberustoffice-image-1.png"));
         let content_xml = export_content_xml(&reloaded.chars, &reloaded.images);
-        assert!(content_xml.contains("<draw:image xlink:href=\"Pictures/liberustoffice-image-1.png\""));
+        assert!(
+            content_xml.contains("<draw:image xlink:href=\"Pictures/liberustoffice-image-1.png\"")
+        );
     }
 
     #[test]
@@ -1797,8 +1809,19 @@ mod tests {
         assert!(styles_xml.contains("fo:line-height=\"130%\""));
         assert!(styles_xml.contains("style:name=\"P5\""));
         assert!(styles_xml.contains("fo:text-align=\"justify\""));
-        assert!(content_xml
-            .contains("<text:h text:style-name=\"P3\" text:outline-level=\"2\">"));
+        assert!(content_xml.contains("<text:h text:style-name=\"P3\" text:outline-level=\"2\">"));
         assert!(content_xml.contains("<text:p text:style-name=\"P5\">Bo</text:p>"));
     }
+}
+fn resolve_export_target_path(path: &Path) -> Result<PathBuf, OdtSaveError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .map_err(|source| OdtSaveError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
 }
