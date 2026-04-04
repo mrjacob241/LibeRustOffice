@@ -25,6 +25,7 @@
 - [ ] Export to PDF
 - [x] Fast and lightweight (written in Rust 🦀)
 - [ ] Real-time collaboration
+- [ ] MCP support
 - [ ] Track changes / comments
 - [ ] Spell checking and grammar suggestions
 - [ ] Full LibreOffice Compatibility

@@ -222,6 +222,34 @@ impl RichTextBoxState {
         self
     }
 
+    pub fn insert_embedded_image(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<(), image::ImageError> {
+        self.delete_selection_if_any();
+
+        let image_index = self
+            .chars
+            .iter()
+            .take(self.cursor_index)
+            .filter(|entry| entry.value == EMBEDDED_IMAGE_OBJECT_CHAR)
+            .count();
+        let image = DocumentImage::load_from_path(path)?;
+
+        self.images.insert(image_index, image);
+        self.chars.insert(
+            self.cursor_index,
+            StyledChar::new(
+                EMBEDDED_IMAGE_OBJECT_CHAR,
+                self.typing_style,
+                self.cursor_adjacent_paragraph_style(),
+            ),
+        );
+        self.select_image_object(self.cursor_index);
+        self.bump_edit_revision();
+        Ok(())
+    }
+
     pub fn ensure_newline_after_embedded_image(&mut self) {
         if self.images.is_empty() {
             return;
@@ -2537,7 +2565,8 @@ fn scroll_cursor_into_view(ui: &mut Ui, state: &RichTextBoxState, layout: &LaidO
 #[cfg(test)]
 mod tests {
     use super::{
-        InlineStyle, ParagraphStyle, RichTextBoxState, StyledChar, PT_TO_PX,
+        InlineStyle, ParagraphStyle, RichTextBoxState, StyledChar,
+        EMBEDDED_IMAGE_OBJECT_CHAR, PT_TO_PX,
     };
     use eframe::egui::Color32;
 
@@ -2587,6 +2616,22 @@ mod tests {
         assert_eq!(state.plain_text(), "abXf");
         assert_eq!(state.cursor_index, 3);
         assert_eq!(state.selected_range(), None);
+    }
+
+    #[test]
+    fn insert_embedded_image_places_image_object_at_cursor() {
+        let mut state = RichTextBoxState::new("abcd");
+        state.cursor_index = 2;
+
+        state
+            .insert_embedded_image("panels_figs/sample_image.png")
+            .expect("sample image should load");
+
+        assert_eq!(state.chars[2].value, EMBEDDED_IMAGE_OBJECT_CHAR);
+        assert_eq!(state.images.len(), 1);
+        assert_eq!(state.selected_image_index(), Some(0));
+        assert_eq!(state.cursor_index, 3);
+        assert_eq!(state.plain_text(), "abcd");
     }
 
     #[test]

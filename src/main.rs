@@ -90,7 +90,7 @@ impl eframe::App for LibeRustOfficeApp {
             ui.horizontal(|ui| {
                 self.draw_file_menu(ui);
                 empty_menu(ui, "Edit");
-                empty_menu(ui, "Insert");
+                self.draw_insert_menu(ui);
                 empty_menu(ui, "Settings");
                 ui.menu_button("Help", |ui| {
                     ui.label("Author: mrjacob241");
@@ -155,6 +155,33 @@ impl LibeRustOfficeApp {
 
             if ui.button("Save as...").clicked() {
                 self.save_document_as();
+                ui.close_menu();
+            }
+        });
+    }
+
+    fn draw_insert_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Insert", |ui| {
+            if ui.button("Image").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "gif", "webp"])
+                    .pick_file()
+                {
+                    match self.editor.insert_embedded_image(&path) {
+                        Ok(()) => {
+                            self.save_status =
+                                format!("Inserted image {}", document_name_from_path(&path));
+                            self.right_panel_open = true;
+                            self.right_panel_tab = RightPanelTab::Image;
+                        }
+                        Err(error) => {
+                            self.report_save_error(format!(
+                                "Failed to insert image {}: {error}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
                 ui.close_menu();
             }
         });
