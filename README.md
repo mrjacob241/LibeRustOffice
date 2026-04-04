@@ -3,9 +3,7 @@
 **LibeRustOffice** is a ODT (Open Document Text format) text editor, which has been vibe coded in the spare time with Codex. But not gonna lie, I wouldn't define it a "project" at this stage, because it barely exists...
 
 
-<p align="center">
-  <img src="panels_figs/sample_image.png" width="50%">
-</p>
+![App Screenshot](panels_figs/sample_image.png)
 
 ## 🚧 Planned Features 🚧 
 
