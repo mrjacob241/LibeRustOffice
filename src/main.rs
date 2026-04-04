@@ -15,6 +15,7 @@ const SIDE_PANEL_MIN_WIDTH: f32 = 180.0;
 const SIDE_PANEL_DEFAULT_WIDTH: f32 = 220.0;
 const SIDE_PANEL_MAX_WIDTH: f32 = 420.0;
 const COLLAPSED_SIDE_RAIL_WIDTH: f32 = 28.0;
+const IMAGE_PANEL_SECTION_GAP: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LeftPanelTab {
@@ -37,6 +38,7 @@ struct LibeRustOfficeApp {
     left_panel_tab: LeftPanelTab,
     right_panel_open: bool,
     right_panel_tab: RightPanelTab,
+    link_image_dimensions: bool,
     save_status: String,
     saved_edit_revision: u64,
 }
@@ -54,6 +56,7 @@ impl Default for LibeRustOfficeApp {
                     left_panel_tab: LeftPanelTab::Document,
                     right_panel_open: true,
                     right_panel_tab: RightPanelTab::Properties,
+                    link_image_dimensions: true,
                     save_status: "Loaded startup document".to_owned(),
                     saved_edit_revision,
                 }
@@ -70,6 +73,7 @@ impl Default for LibeRustOfficeApp {
                     left_panel_tab: LeftPanelTab::Document,
                     right_panel_open: true,
                     right_panel_tab: RightPanelTab::Properties,
+                    link_image_dimensions: true,
                     save_status: "Editing new unsaved document".to_owned(),
                     saved_edit_revision,
                 }
@@ -105,6 +109,11 @@ impl eframe::App for LibeRustOfficeApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add(RichTextBox::new(&mut self.editor).desired_rows(18));
         });
+
+        if self.editor.take_open_image_tab_request() {
+            self.right_panel_open = true;
+            self.right_panel_tab = RightPanelTab::Image;
+        }
     }
 }
 
@@ -303,51 +312,143 @@ impl LibeRustOfficeApp {
                         }
                         RightPanelTab::Image => {
                             if let Some((image_index, image)) = self.editor.selected_image() {
+                                let mut image_path = image.path.display().to_string();
+                                let mut image_width = image.size.x;
+                                let mut image_height = image.size.y;
+                                let mut margin_left = image.margin_left;
+                                let mut margin_right = image.margin_right;
+                                let mut margin_top = image.margin_top;
+                                let mut margin_bottom = image.margin_bottom;
+                                let mut center_horizontally = image.center_horizontally;
+                                let aspect_ratio = if image.size.y > 0.0 {
+                                    image.size.x / image.size.y
+                                } else {
+                                    1.0
+                                };
+
                                 ui.label(format!("Selected image #{image_index}"));
-                                draw_readonly_text_field(
+
+                                let mut image_changed = false;
+                                let mut path_reload_error = None;
+
+                                if draw_editable_text_field(
                                     ui,
                                     "Path",
-                                    &image.path.display().to_string(),
-                                );
-                                draw_readonly_text_field(
+                                    &mut image_path,
+                                    &mut self.editor.editor_active,
+                                ) {
+                                    match self.editor.images[image_index]
+                                        .reload_from_path(image_path.trim())
+                                    {
+                                        Ok(()) => image_changed = true,
+                                        Err(error) => path_reload_error = Some(error.to_string()),
+                                    }
+                                }
+
+                                ui.add_space(IMAGE_PANEL_SECTION_GAP);
+                                ui.label("Image dimensions");
+                                ui.horizontal(|ui| {
+                                    ui.label("Keep ratio");
+                                    let response = ui.checkbox(&mut self.link_image_dimensions, "");
+                                    if response.clicked() || response.has_focus() {
+                                        self.editor.editor_active = false;
+                                    }
+                                });
+
+                                let width_changed = draw_f32_drag_field(
                                     ui,
                                     "Width",
-                                    &format!("{:.1}", image.size.x),
+                                    &mut image_width,
+                                    1.0,
+                                    4096.0,
+                                    &mut self.editor.editor_active,
                                 );
-                                draw_readonly_text_field(
+                                if width_changed && self.link_image_dimensions && aspect_ratio > 0.0
+                                {
+                                    image_height = (image_width / aspect_ratio).max(1.0);
+                                }
+                                image_changed |= width_changed;
+
+                                let height_changed = draw_f32_drag_field(
                                     ui,
                                     "Height",
-                                    &format!("{:.1}", image.size.y),
+                                    &mut image_height,
+                                    1.0,
+                                    4096.0,
+                                    &mut self.editor.editor_active,
                                 );
-                                draw_readonly_text_field(
+                                if height_changed
+                                    && self.link_image_dimensions
+                                    && aspect_ratio > 0.0
+                                {
+                                    image_width = (image_height * aspect_ratio).max(1.0);
+                                }
+                                image_changed |= height_changed;
+
+                                ui.add_space(IMAGE_PANEL_SECTION_GAP);
+                                ui.label("Margins");
+                                image_changed |= draw_f32_drag_field(
                                     ui,
                                     "Margin L",
-                                    &format!("{:.1}", image.margin_left),
+                                    &mut margin_left,
+                                    0.0,
+                                    2048.0,
+                                    &mut self.editor.editor_active,
                                 );
-                                draw_readonly_text_field(
+                                image_changed |= draw_f32_drag_field(
                                     ui,
                                     "Margin R",
-                                    &format!("{:.1}", image.margin_right),
+                                    &mut margin_right,
+                                    0.0,
+                                    2048.0,
+                                    &mut self.editor.editor_active,
                                 );
-                                draw_readonly_text_field(
+                                image_changed |= draw_f32_drag_field(
                                     ui,
                                     "Margin T",
-                                    &format!("{:.1}", image.margin_top),
+                                    &mut margin_top,
+                                    0.0,
+                                    2048.0,
+                                    &mut self.editor.editor_active,
                                 );
-                                draw_readonly_text_field(
+                                image_changed |= draw_f32_drag_field(
                                     ui,
                                     "Margin B",
-                                    &format!("{:.1}", image.margin_bottom),
+                                    &mut margin_bottom,
+                                    0.0,
+                                    2048.0,
+                                    &mut self.editor.editor_active,
                                 );
-                                draw_readonly_text_field(
-                                    ui,
-                                    "Centered",
-                                    if image.center_horizontally {
-                                        "true"
-                                    } else {
-                                        "false"
-                                    },
-                                );
+
+                                ui.add_space(IMAGE_PANEL_SECTION_GAP);
+                                ui.label("Anchor");
+                                ui.horizontal(|ui| {
+                                    ui.label("Centered");
+                                    let response = ui.checkbox(&mut center_horizontally, "");
+                                    if response.clicked() || response.has_focus() {
+                                        self.editor.editor_active = false;
+                                    }
+                                    image_changed |= response.changed();
+                                });
+
+                                if image_changed {
+                                    if let Some(image) = self.editor.images.get_mut(image_index) {
+                                        image.size =
+                                            egui::vec2(image_width.max(1.0), image_height.max(1.0));
+                                        image.margin_left = margin_left.max(0.0);
+                                        image.margin_right = margin_right.max(0.0);
+                                        image.margin_top = margin_top.max(0.0);
+                                        image.margin_bottom = margin_bottom.max(0.0);
+                                        image.center_horizontally = center_horizontally;
+                                    }
+                                    self.editor.mark_image_edited();
+                                    self.save_status =
+                                        format!("Updated image #{image_index} properties");
+                                }
+
+                                if let Some(error) = path_reload_error {
+                                    self.save_status = format!("Image reload failed: {error}");
+                                }
                             } else {
                                 ui.label("No image selected");
                                 ui.label(
@@ -447,10 +548,43 @@ fn empty_menu(ui: &mut egui::Ui, label: &str) {
     ui.menu_button(label, |_ui| {});
 }
 
-fn draw_readonly_text_field(ui: &mut egui::Ui, label: &str, value: &str) {
+fn draw_editable_text_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    editor_active: &mut bool,
+) -> bool {
     ui.label(label);
-    let mut text = value.to_owned();
-    ui.add_enabled(false, egui::TextEdit::singleline(&mut text));
+    let response = ui.add(egui::TextEdit::singleline(value));
+    if response.clicked() || response.has_focus() {
+        *editor_active = false;
+    }
+    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+}
+
+fn draw_f32_drag_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    min_value: f32,
+    max_value: f32,
+    editor_active: &mut bool,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let response = ui.add(
+            egui::DragValue::new(value)
+                .speed(1.0)
+                .clamp_range(min_value..=max_value)
+                .max_decimals(1),
+        );
+        if response.clicked() || response.has_focus() {
+            *editor_active = false;
+        }
+        changed = response.changed();
+    });
+    changed
 }
 
 fn document_name_from_path(path: impl AsRef<Path>) -> String {

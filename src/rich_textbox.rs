@@ -162,6 +162,7 @@ pub struct RichTextBoxState {
     pub selection_anchor: Option<usize>,
     pub selection_focus: Option<usize>,
     pub edit_revision: u64,
+    open_image_tab_requested: bool,
 }
 
 impl RichTextBoxState {
@@ -196,6 +197,7 @@ impl RichTextBoxState {
             selection_anchor: None,
             selection_focus: None,
             edit_revision: 0,
+            open_image_tab_requested: false,
         }
     }
 
@@ -375,7 +377,7 @@ impl RichTextBoxState {
         self.cursor_index = end;
     }
 
-    pub fn selected_image(&self) -> Option<(usize, &DocumentImage)> {
+    pub fn selected_image_index(&self) -> Option<usize> {
         let selection_range = self.selected_range()?;
         if selection_range.len() != 1 {
             return None;
@@ -394,9 +396,24 @@ impl RichTextBoxState {
             .count()
             .saturating_sub(1);
 
+        (image_index < self.images.len()).then_some(image_index)
+    }
+
+    pub fn selected_image(&self) -> Option<(usize, &DocumentImage)> {
+        let image_index = self.selected_image_index()?;
         self.images
             .get(image_index)
             .map(|image| (image_index, image))
+    }
+
+    pub fn mark_image_edited(&mut self) {
+        self.bump_edit_revision();
+    }
+
+    pub fn take_open_image_tab_request(&mut self) -> bool {
+        let requested = self.open_image_tab_requested;
+        self.open_image_tab_requested = false;
+        requested
     }
 
     pub fn toggle_bold(&mut self) {
@@ -574,6 +591,24 @@ impl DocumentImage {
             0.0,
             false,
         )
+    }
+
+    pub fn reload_from_path(&mut self, path: impl AsRef<Path>) -> Result<(), image::ImageError> {
+        let replacement = Self::from_encoded_bytes(
+            path.as_ref().to_path_buf(),
+            &std::fs::read(path.as_ref())?,
+            Some(self.size),
+            self.margin_left,
+            self.margin_right,
+            self.margin_top,
+            self.margin_bottom,
+            self.center_horizontally,
+        )?;
+
+        self.path = replacement.path;
+        self.color_image = replacement.color_image;
+        self.texture = None;
+        Ok(())
     }
 
     fn texture_handle(&mut self, ui: &Ui, image_index: usize) -> TextureHandle {
@@ -775,7 +810,10 @@ impl Widget for RichTextBox<'_> {
                     self.state.page_scale,
                 );
                 let zoom_shortcut_changed = consume_page_zoom_shortcut(ui, self.state);
+                let editor_canvas_has_focus =
+                    ui.memory(|memory| memory.has_focus(editor_canvas_id()));
                 let keyboard_changed = self.state.editor_active
+                    && editor_canvas_has_focus
                     && consume_keyboard_input(ui, self.state, &keyboard_layout);
 
                 let scroll_output = egui::ScrollArea::both()
@@ -848,6 +886,11 @@ impl Widget for RichTextBox<'_> {
                                 } else {
                                     self.state.cursor_index = hit_index;
                                     self.state.clear_selection();
+                                }
+                            } else if response.secondary_clicked() {
+                                if let Some(image_char_index) = hit_image_char_index {
+                                    self.state.select_image_object(image_char_index);
+                                    self.state.open_image_tab_requested = true;
                                 }
                             }
                         }
