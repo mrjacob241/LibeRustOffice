@@ -47,6 +47,11 @@ pub const TEXT_COLOR_PALETTE: [Color32; 5] = [
     Color32::from_rgb(255, 165, 0),
 ];
 pub const EDITOR_CANVAS_ID_SOURCE: &str = "libe_rust_office_editor_canvas";
+const GENERATED_BULLET_LIST_STYLE_NAME: &str = "LroBulletList";
+const GENERATED_BULLET_MARKER: char = '•';
+const GENERATED_NUMBERED_LIST_STYLE_NAME: &str = "LroNumberedList";
+const GENERATED_NUMBERED_LIST_MARKER: char = '.';
+const GENERATED_NUMBERED_LIST_START: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InlineStyle {
@@ -515,6 +520,69 @@ impl RichTextBoxState {
             .unwrap_or_else(|| self.cursor_adjacent_style().color)
     }
 
+    pub fn active_bullet_list(&self) -> bool {
+        let line_start = self.current_line_start_index();
+        let line_end = self.current_line_end_index(line_start);
+        self.current_line_list_style(line_start, line_end)
+            .is_some_and(|style| {
+                style.list_marker == Some(GENERATED_BULLET_MARKER) && style.list_number.is_none()
+            })
+    }
+
+    pub fn active_numbered_list(&self) -> bool {
+        let line_start = self.current_line_start_index();
+        let line_end = self.current_line_end_index(line_start);
+        self.current_line_list_style(line_start, line_end)
+            .is_some_and(|style| {
+                style.list_marker == Some(GENERATED_NUMBERED_LIST_MARKER)
+                    && style.list_number.is_some()
+            })
+    }
+
+    pub fn toggle_bullet_list(&mut self) {
+        let line_start = self.current_line_start_index();
+        let line_end = self.current_line_end_index(line_start);
+
+        if let Some(list_style) = self.current_line_list_style(line_start, line_end) {
+            if list_style.list_marker == Some(GENERATED_BULLET_MARKER)
+                && list_style.list_number.is_none()
+            {
+                self.remove_current_line_list_prefix(line_start, line_end, &list_style);
+            } else {
+                self.replace_current_line_list_prefix_with_bullet(
+                    line_start,
+                    line_end,
+                    &list_style,
+                );
+            }
+            return;
+        }
+
+        self.insert_current_line_bullet_prefix(line_start, line_end);
+    }
+
+    pub fn toggle_numbered_list(&mut self) {
+        let line_start = self.current_line_start_index();
+        let line_end = self.current_line_end_index(line_start);
+
+        if let Some(list_style) = self.current_line_list_style(line_start, line_end) {
+            if list_style.list_marker == Some(GENERATED_NUMBERED_LIST_MARKER)
+                && list_style.list_number.is_some()
+            {
+                self.remove_current_line_list_prefix(line_start, line_end, &list_style);
+            } else {
+                self.replace_current_line_list_prefix_with_numbered(
+                    line_start,
+                    line_end,
+                    &list_style,
+                );
+            }
+            return;
+        }
+
+        self.insert_current_line_numbered_prefix(line_start, line_end);
+    }
+
     fn delete_selection_if_any(&mut self) -> bool {
         let Some(range) = self.selected_range() else {
             return false;
@@ -696,6 +764,191 @@ impl RichTextBoxState {
             .find(|entry| entry.paragraph_style.list_marker.is_some())
             .map(|entry| entry.paragraph_style.clone())
     }
+
+    fn insert_current_line_bullet_prefix(&mut self, line_start: usize, line_end: usize) {
+        let mut paragraph_style = self
+            .chars
+            .get(line_start)
+            .map(|entry| entry.paragraph_style.clone())
+            .unwrap_or_else(|| self.cursor_adjacent_paragraph_style());
+        paragraph_style.list_style_name = Some(GENERATED_BULLET_LIST_STYLE_NAME.to_owned());
+        paragraph_style.list_marker = Some(GENERATED_BULLET_MARKER);
+        paragraph_style.list_number = None;
+
+        self.apply_paragraph_style_to_line(line_start, line_end, paragraph_style.clone());
+        self.chars.splice(
+            line_start..line_start,
+            [
+                StyledChar::new('\t', self.typing_style, paragraph_style.clone()),
+                StyledChar::new(
+                    GENERATED_BULLET_MARKER,
+                    self.typing_style,
+                    paragraph_style.clone(),
+                ),
+                StyledChar::new('\t', self.typing_style, paragraph_style),
+            ],
+        );
+        if self.cursor_index >= line_start {
+            self.cursor_index += 3;
+        }
+        self.clear_selection();
+        self.bump_edit_revision();
+    }
+
+    fn insert_current_line_numbered_prefix(&mut self, line_start: usize, line_end: usize) {
+        let mut paragraph_style = self
+            .chars
+            .get(line_start)
+            .map(|entry| entry.paragraph_style.clone())
+            .unwrap_or_else(|| self.cursor_adjacent_paragraph_style());
+        paragraph_style.list_style_name = Some(GENERATED_NUMBERED_LIST_STYLE_NAME.to_owned());
+        paragraph_style.list_marker = Some(GENERATED_NUMBERED_LIST_MARKER);
+        paragraph_style.list_number = Some(GENERATED_NUMBERED_LIST_START);
+
+        self.apply_paragraph_style_to_line(line_start, line_end, paragraph_style.clone());
+        self.chars.splice(
+            line_start..line_start,
+            [
+                StyledChar::new('\t', self.typing_style, paragraph_style.clone()),
+                StyledChar::new('1', self.typing_style, paragraph_style.clone()),
+                StyledChar::new(
+                    GENERATED_NUMBERED_LIST_MARKER,
+                    self.typing_style,
+                    paragraph_style.clone(),
+                ),
+                StyledChar::new('\t', self.typing_style, paragraph_style),
+            ],
+        );
+        if self.cursor_index >= line_start {
+            self.cursor_index += 4;
+        }
+        self.clear_selection();
+        self.bump_edit_revision();
+    }
+
+    fn replace_current_line_list_prefix_with_bullet(
+        &mut self,
+        line_start: usize,
+        line_end: usize,
+        list_style: &ParagraphStyle,
+    ) {
+        let Some(prefix_len) = list_prefix_len(&self.chars[line_start..line_end], list_style)
+        else {
+            return;
+        };
+        let mut paragraph_style = list_style.clone();
+        paragraph_style.list_style_name = Some(GENERATED_BULLET_LIST_STYLE_NAME.to_owned());
+        paragraph_style.list_marker = Some(GENERATED_BULLET_MARKER);
+        paragraph_style.list_number = None;
+
+        self.apply_paragraph_style_to_line(line_start, line_end, paragraph_style.clone());
+        self.chars.splice(
+            line_start..line_start + prefix_len,
+            [
+                StyledChar::new('\t', self.typing_style, paragraph_style.clone()),
+                StyledChar::new(
+                    GENERATED_BULLET_MARKER,
+                    self.typing_style,
+                    paragraph_style.clone(),
+                ),
+                StyledChar::new('\t', self.typing_style, paragraph_style),
+            ],
+        );
+        self.cursor_index = if self.cursor_index <= line_start {
+            self.cursor_index
+        } else {
+            line_start + 3 + self.cursor_index.saturating_sub(line_start + prefix_len)
+        }
+        .min(self.chars.len());
+        self.clear_selection();
+        self.bump_edit_revision();
+    }
+
+    fn replace_current_line_list_prefix_with_numbered(
+        &mut self,
+        line_start: usize,
+        line_end: usize,
+        list_style: &ParagraphStyle,
+    ) {
+        let Some(prefix_len) = list_prefix_len(&self.chars[line_start..line_end], list_style)
+        else {
+            return;
+        };
+        let mut paragraph_style = list_style.clone();
+        paragraph_style.list_style_name = Some(GENERATED_NUMBERED_LIST_STYLE_NAME.to_owned());
+        paragraph_style.list_marker = Some(GENERATED_NUMBERED_LIST_MARKER);
+        paragraph_style.list_number = Some(GENERATED_NUMBERED_LIST_START);
+
+        self.apply_paragraph_style_to_line(line_start, line_end, paragraph_style.clone());
+        self.chars.splice(
+            line_start..line_start + prefix_len,
+            [
+                StyledChar::new('\t', self.typing_style, paragraph_style.clone()),
+                StyledChar::new('1', self.typing_style, paragraph_style.clone()),
+                StyledChar::new(
+                    GENERATED_NUMBERED_LIST_MARKER,
+                    self.typing_style,
+                    paragraph_style.clone(),
+                ),
+                StyledChar::new('\t', self.typing_style, paragraph_style),
+            ],
+        );
+        self.cursor_index = if self.cursor_index <= line_start {
+            self.cursor_index
+        } else {
+            line_start + 4 + self.cursor_index.saturating_sub(line_start + prefix_len)
+        }
+        .min(self.chars.len());
+        self.clear_selection();
+        self.bump_edit_revision();
+    }
+
+    fn remove_current_line_list_prefix(
+        &mut self,
+        line_start: usize,
+        line_end: usize,
+        list_style: &ParagraphStyle,
+    ) {
+        let Some(prefix_len) = list_prefix_len(&self.chars[line_start..line_end], list_style)
+        else {
+            return;
+        };
+
+        self.chars.drain(line_start..line_start + prefix_len);
+        let updated_line_end = self.current_line_end_index(line_start);
+        self.clear_paragraph_style_from_line(line_start, updated_line_end);
+        self.cursor_index = if self.cursor_index <= line_start {
+            self.cursor_index
+        } else {
+            self.cursor_index.saturating_sub(prefix_len).max(line_start)
+        }
+        .min(self.chars.len());
+        self.clear_selection();
+        self.bump_edit_revision();
+    }
+
+    fn apply_paragraph_style_to_line(
+        &mut self,
+        line_start: usize,
+        line_end: usize,
+        paragraph_style: ParagraphStyle,
+    ) {
+        for entry in &mut self.chars[line_start..line_end] {
+            entry.paragraph_style = paragraph_style.clone();
+        }
+        if let Some(entry) = self.chars.get_mut(line_end).filter(|entry| entry.value == '\n') {
+            entry.paragraph_style = paragraph_style;
+        }
+    }
+
+    fn clear_paragraph_style_from_line(&mut self, line_start: usize, line_end: usize) {
+        for entry in &mut self.chars[line_start..line_end] {
+            clear_paragraph_list_style(&mut entry.paragraph_style);
+        }
+        if let Some(entry) = self.chars.get_mut(line_end).filter(|entry| entry.value == '\n') {
+            clear_paragraph_list_style(&mut entry.paragraph_style);
+        }
+    }
 }
 
 fn clear_paragraph_list_style(paragraph_style: &mut ParagraphStyle) {
@@ -715,6 +968,38 @@ fn line_has_only_list_prefix(line_chars: &[StyledChar], list_style: &ParagraphSt
             || entry.value == marker
             || (list_style.list_number.is_some() && entry.value.is_ascii_digit())
     })
+}
+
+fn list_prefix_len(line_chars: &[StyledChar], list_style: &ParagraphStyle) -> Option<usize> {
+    let mut index = 0;
+    if line_chars.get(index)?.value != '\t' {
+        return None;
+    }
+    index += 1;
+
+    if list_style.list_number.is_some() {
+        let digits_start = index;
+        while line_chars
+            .get(index)
+            .is_some_and(|entry| entry.value.is_ascii_digit())
+        {
+            index += 1;
+        }
+        if index == digits_start {
+            return None;
+        }
+    }
+
+    if line_chars.get(index)?.value != list_style.list_marker? {
+        return None;
+    }
+    index += 1;
+
+    if line_chars.get(index)?.value != '\t' {
+        return None;
+    }
+
+    Some(index + 1)
 }
 
 impl DocumentImage {
@@ -1216,6 +1501,17 @@ pub fn draw_editor_toolbar(ui: &mut Ui, state: &mut RichTextBoxState) {
                 }
                 if toolbar_size_step(ui, "+", state.page_scale < MAX_PAGE_SCALE) {
                     state.zoom_in_page();
+                    focus_editor_canvas(ui);
+                }
+
+                ui.separator();
+                if toolbar_toggle(ui, "• ◦ ▪", state.active_bullet_list(), false, false, false) {
+                    state.toggle_bullet_list();
+                    focus_editor_canvas(ui);
+                }
+                if toolbar_toggle(ui, "1. 2. 3.", state.active_numbered_list(), false, false, false)
+                {
+                    state.toggle_numbered_list();
                     focus_editor_canvas(ui);
                 }
             });
@@ -2433,6 +2729,156 @@ mod tests {
         assert_eq!(state.plain_text(), "\nPlain");
         assert_eq!(state.chars[0].paragraph_style.list_number, None);
         assert_eq!(state.chars[0].paragraph_style.list_marker, None);
+    }
+
+    #[test]
+    fn toggling_bullets_adds_prefix_to_current_plain_line() {
+        let mut state = RichTextBoxState::new("Alpha\nBeta");
+        state.cursor_index = 2;
+
+        state.toggle_bullet_list();
+
+        assert_eq!(state.plain_text(), "\t•\tAlpha\nBeta");
+        assert!(state.active_bullet_list());
+        assert_eq!(state.cursor_index, 5);
+        assert_eq!(state.chars[0].paragraph_style.list_marker, Some('•'));
+        assert_eq!(state.chars[4].paragraph_style.list_marker, Some('•'));
+        assert_eq!(state.chars[9].paragraph_style.list_marker, None);
+    }
+
+    #[test]
+    fn toggling_bullets_removes_prefix_from_current_bullet_line() {
+        let list_paragraph_style = ParagraphStyle {
+            list_style_name: Some("LroBulletList".to_owned()),
+            list_marker: Some('•'),
+            ..ParagraphStyle::default()
+        };
+        let body_paragraph_style = ParagraphStyle::default();
+        let mut state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('•', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('A', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('l', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('p', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('h', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('a', InlineStyle::default(), list_paragraph_style),
+            StyledChar::new('\n', InlineStyle::default(), body_paragraph_style),
+        ]);
+        state.cursor_index = 5;
+
+        state.toggle_bullet_list();
+
+        assert_eq!(state.plain_text(), "Alpha\n");
+        assert!(!state.active_bullet_list());
+        assert_eq!(state.cursor_index, 2);
+        assert!(state.chars[..5]
+            .iter()
+            .all(|entry| entry.paragraph_style.list_marker.is_none()));
+    }
+
+    #[test]
+    fn toggling_bullets_converts_current_numbered_line_to_bullet() {
+        let list_paragraph_style = ParagraphStyle {
+            list_style_name: Some("L2".to_owned()),
+            list_marker: Some('.'),
+            list_number: Some(12),
+            ..ParagraphStyle::default()
+        };
+        let mut state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('1', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('2', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('.', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('I', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('e', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('m', InlineStyle::default(), list_paragraph_style),
+        ]);
+        state.cursor_index = 7;
+
+        state.toggle_bullet_list();
+
+        assert_eq!(state.plain_text(), "\t•\tItem");
+        assert!(state.active_bullet_list());
+        assert_eq!(state.cursor_index, 5);
+        assert_eq!(state.chars[0].paragraph_style.list_marker, Some('•'));
+        assert_eq!(state.chars[0].paragraph_style.list_number, None);
+    }
+
+    #[test]
+    fn toggling_numbered_list_adds_prefix_to_current_plain_line() {
+        let mut state = RichTextBoxState::new("Alpha\nBeta");
+        state.cursor_index = 2;
+
+        state.toggle_numbered_list();
+
+        assert_eq!(state.plain_text(), "\t1.\tAlpha\nBeta");
+        assert!(state.active_numbered_list());
+        assert_eq!(state.cursor_index, 6);
+        assert_eq!(state.chars[1].paragraph_style.list_marker, Some('.'));
+        assert_eq!(state.chars[1].paragraph_style.list_number, Some(1));
+        assert_eq!(state.chars[10].paragraph_style.list_marker, None);
+    }
+
+    #[test]
+    fn toggling_numbered_list_removes_prefix_from_current_numbered_line() {
+        let list_paragraph_style = ParagraphStyle {
+            list_style_name: Some("LroNumberedList".to_owned()),
+            list_marker: Some('.'),
+            list_number: Some(1),
+            ..ParagraphStyle::default()
+        };
+        let mut state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('1', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('.', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('A', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('l', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('p', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('h', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('a', InlineStyle::default(), list_paragraph_style),
+        ]);
+        state.cursor_index = 6;
+
+        state.toggle_numbered_list();
+
+        assert_eq!(state.plain_text(), "Alpha");
+        assert!(!state.active_numbered_list());
+        assert_eq!(state.cursor_index, 2);
+        assert!(state
+            .chars
+            .iter()
+            .all(|entry| entry.paragraph_style.list_marker.is_none()));
+    }
+
+    #[test]
+    fn toggling_numbered_list_converts_current_bullet_line_to_numbered() {
+        let list_paragraph_style = ParagraphStyle {
+            list_style_name: Some("LroBulletList".to_owned()),
+            list_marker: Some('•'),
+            ..ParagraphStyle::default()
+        };
+        let mut state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('•', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('I', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('e', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('m', InlineStyle::default(), list_paragraph_style),
+        ]);
+        state.cursor_index = 5;
+
+        state.toggle_numbered_list();
+
+        assert_eq!(state.plain_text(), "\t1.\tItem");
+        assert!(state.active_numbered_list());
+        assert_eq!(state.cursor_index, 6);
+        assert_eq!(state.chars[0].paragraph_style.list_marker, Some('.'));
+        assert_eq!(state.chars[0].paragraph_style.list_number, Some(1));
     }
 
     #[test]

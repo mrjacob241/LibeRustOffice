@@ -22,6 +22,8 @@ const STYLES_XML_ENTRY: &str = "styles.xml";
 const PICTURES_DIR: &str = "Pictures";
 const EXPORT_PARAGRAPH_STYLE_NAME: &str = "LroBody";
 const EXPORT_HEADING_STYLE_NAME: &str = "LroHeading2";
+const GENERATED_BULLET_LIST_STYLE_NAME: &str = "LroBulletList";
+const GENERATED_NUMBERED_LIST_STYLE_NAME: &str = "LroNumberedList";
 const PARAGRAPH_OPEN_TAG: &str = "<text:p";
 const PARAGRAPH_CLOSE_TAG: &str = "</text:p>";
 const HEADING_OPEN_TAG: &str = "<text:h";
@@ -774,6 +776,74 @@ fn extract_document_content(
     Ok(OdtDocument { chars, images })
 }
 
+fn normalize_tab_prefixed_list_metadata_for_export(chars: &mut [StyledChar]) {
+    let mut line_start = 0;
+    while line_start < chars.len() {
+        let mut line_end = line_start;
+        while line_end < chars.len() && chars[line_end].value != '\n' {
+            line_end += 1;
+        }
+
+        if chars[line_start..line_end]
+            .iter()
+            .all(|entry| entry.paragraph_style.list_marker.is_none())
+        {
+            if let Some(list_style) = detect_tab_prefixed_list_style(&chars[line_start..line_end]) {
+                for entry in &mut chars[line_start..line_end] {
+                    entry.paragraph_style.list_style_name = list_style.list_style_name.clone();
+                    entry.paragraph_style.list_marker = list_style.list_marker;
+                    entry.paragraph_style.list_number = list_style.list_number;
+                }
+                if let Some(entry) = chars.get_mut(line_end).filter(|entry| entry.value == '\n') {
+                    entry.paragraph_style.list_style_name = list_style.list_style_name;
+                    entry.paragraph_style.list_marker = list_style.list_marker;
+                    entry.paragraph_style.list_number = list_style.list_number;
+                }
+            }
+        }
+
+        line_start = line_end.saturating_add(1);
+    }
+}
+
+fn detect_tab_prefixed_list_style(line_chars: &[StyledChar]) -> Option<ParagraphStyle> {
+    if line_chars.get(0)?.value != '\t' {
+        return None;
+    }
+
+    let base_style = line_chars.get(0)?.paragraph_style.clone();
+    if line_chars.get(1)?.value == '•' && line_chars.get(2)?.value == '\t' {
+        let mut list_style = base_style;
+        list_style.list_style_name = Some(GENERATED_BULLET_LIST_STYLE_NAME.to_owned());
+        list_style.list_marker = Some('•');
+        list_style.list_number = None;
+        return Some(list_style);
+    }
+
+    let mut marker_index = 1;
+    while line_chars
+        .get(marker_index)
+        .is_some_and(|entry| entry.value.is_ascii_digit())
+    {
+        marker_index += 1;
+    }
+    if marker_index == 1 || line_chars.get(marker_index + 1)?.value != '\t' {
+        return None;
+    }
+
+    let list_number = line_chars[1..marker_index]
+        .iter()
+        .map(|entry| entry.value)
+        .collect::<String>()
+        .parse::<u32>()
+        .ok()?;
+    let mut list_style = base_style;
+    list_style.list_style_name = Some(GENERATED_NUMBERED_LIST_STYLE_NAME.to_owned());
+    list_style.list_marker = Some(line_chars.get(marker_index)?.value);
+    list_style.list_number = Some(list_number);
+    Some(list_style)
+}
+
 fn append_decoded_text(
     chars: &mut Vec<StyledChar>,
     raw_text: &str,
@@ -1217,6 +1287,9 @@ fn export_manifest_xml(images: &[DocumentImage]) -> String {
 }
 
 fn export_styles_xml(chars: &[StyledChar]) -> String {
+    let mut export_chars = chars.to_vec();
+    normalize_tab_prefixed_list_metadata_for_export(&mut export_chars);
+
     let mut xml = String::from(
         r##"<?xml version="1.0" encoding="UTF-8"?>
 <office:document-styles
@@ -1235,7 +1308,7 @@ fn export_styles_xml(chars: &[StyledChar]) -> String {
 "##,
     );
 
-    for paragraph_style in collect_export_paragraph_styles(chars) {
+    for paragraph_style in collect_export_paragraph_styles(&export_chars) {
         xml.push_str(&format!(
             "    <style:style style:name=\"{}\" style:family=\"paragraph\">\n      <style:paragraph-properties fo:text-align=\"{}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" fo:line-height=\"{:.0}%\"/>\n    </style:style>\n",
             encode_xml_text(&paragraph_style.style_name),
@@ -1246,6 +1319,27 @@ fn export_styles_xml(chars: &[StyledChar]) -> String {
             export_length_inches(paragraph_style.margin_right),
             paragraph_style.line_height_percent.unwrap_or(115.0),
         ));
+    }
+
+    for list_style in collect_export_list_styles(&export_chars) {
+        let style_name = list_style
+            .list_style_name
+            .as_deref()
+            .unwrap_or(EXPORT_PARAGRAPH_STYLE_NAME);
+        if let Some(list_number) = list_style.list_number {
+            xml.push_str(&format!(
+                "    <text:list-style style:name=\"{}\"><text:list-level-style-number text:level=\"1\" text:start-value=\"{}\" style:num-suffix=\"{}\"/></text:list-style>\n",
+                encode_xml_text(style_name),
+                list_number,
+                encode_xml_text(&list_style.list_marker.unwrap_or('.').to_string()),
+            ));
+        } else if let Some(list_marker) = list_style.list_marker {
+            xml.push_str(&format!(
+                "    <text:list-style style:name=\"{}\"><text:list-level-style-bullet text:level=\"1\" text:bullet-char=\"{}\"/></text:list-style>\n",
+                encode_xml_text(style_name),
+                encode_xml_text(&list_marker.to_string()),
+            ));
+        }
     }
 
     xml.push_str(
@@ -1259,11 +1353,14 @@ fn export_styles_xml(chars: &[StyledChar]) -> String {
 fn collect_export_paragraph_styles(chars: &[StyledChar]) -> Vec<ParagraphStyle> {
     let mut styles = Vec::new();
     for entry in chars {
-        if !styles
-            .iter()
-            .any(|style: &ParagraphStyle| *style == entry.paragraph_style)
+        let mut paragraph_style = entry.paragraph_style.clone();
+        paragraph_style.list_style_name = None;
+        paragraph_style.list_marker = None;
+        paragraph_style.list_number = None;
+
+        if !styles.iter().any(|style| *style == paragraph_style)
         {
-            styles.push(entry.paragraph_style.clone());
+            styles.push(paragraph_style);
         }
     }
 
@@ -1271,6 +1368,55 @@ fn collect_export_paragraph_styles(chars: &[StyledChar]) -> Vec<ParagraphStyle> 
         styles.push(ParagraphStyle::default());
     }
 
+    let mut line_start = 0;
+    while line_start < chars.len() {
+        let mut line_end = line_start;
+        while line_end < chars.len() && chars[line_end].value != '\n' {
+            line_end += 1;
+        }
+
+        let line_style = chars
+            .get(line_start..line_end)
+            .and_then(|line_chars| line_chars.first())
+            .map(|entry| entry.paragraph_style.clone());
+        let next_line_style = chars.get(line_end + 1).map(|entry| entry.paragraph_style.clone());
+        if let Some(line_style) = line_style {
+            if line_style.list_marker.is_some() {
+                let list_item_style = paragraph_style_for_generated_list_item(line_style);
+                if !styles.iter().any(|style| *style == list_item_style) {
+                    styles.push(list_item_style);
+                }
+            } else if next_line_style
+                .as_ref()
+                .is_some_and(|style| style.list_marker.is_some())
+            {
+                let before_list_style = paragraph_style_before_generated_list(line_style);
+                if !styles.iter().any(|style| *style == before_list_style) {
+                    styles.push(before_list_style);
+                }
+            }
+        }
+
+        line_start = line_end.saturating_add(1);
+    }
+
+    styles
+}
+
+fn collect_export_list_styles(chars: &[StyledChar]) -> Vec<ParagraphStyle> {
+    let mut styles = Vec::new();
+    for entry in chars {
+        if entry.paragraph_style.list_marker.is_none() {
+            continue;
+        }
+        if !styles.iter().any(|style: &ParagraphStyle| {
+            style.list_style_name == entry.paragraph_style.list_style_name
+                && style.list_marker == entry.paragraph_style.list_marker
+                && style.list_number.is_some() == entry.paragraph_style.list_number.is_some()
+        }) {
+            styles.push(entry.paragraph_style.clone());
+        }
+    }
     styles
 }
 
@@ -1284,6 +1430,9 @@ fn export_paragraph_alignment(alignment: ParagraphAlignment) -> &'static str {
 }
 
 fn export_content_xml(chars: &[StyledChar], images: &[DocumentImage]) -> String {
+    let mut export_chars = chars.to_vec();
+    normalize_tab_prefixed_list_metadata_for_export(&mut export_chars);
+
     let mut style_runs = ExportStyleRegistry::default();
     let mut xml = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1300,37 +1449,96 @@ fn export_content_xml(chars: &[StyledChar], images: &[DocumentImage]) -> String 
 "#,
     );
 
-    style_runs.collect_styles(chars);
+    style_runs.collect_styles(&export_chars);
     xml.push_str(&style_runs.as_xml());
     xml.push_str(&export_image_styles_xml(images));
     xml.push_str(
         "  </office:automatic-styles>\n  <office:body>\n    <office:text text:use-soft-page-breaks=\"true\">\n",
     );
 
-    for paragraph in export_paragraphs(chars, images, &style_runs) {
-        match paragraph.style.kind {
-            ParagraphKind::Body => {
-                xml.push_str(&format!(
-                    "      <text:p text:style-name=\"{}\">",
-                    encode_xml_text(&paragraph.style.style_name)
-                ));
-                xml.push_str(&paragraph.xml);
-                xml.push_str("</text:p>\n");
+    let mut open_list_style_name: Option<String> = None;
+    for paragraph in export_paragraphs(&export_chars, images, &style_runs) {
+        let paragraph_list_style_name = paragraph.style.list_style_name.clone();
+        if paragraph_list_style_name.is_some() && export_list_item_is_empty(&paragraph) {
+            if open_list_style_name.is_some() {
+                xml.push_str("      </text:list>\n");
+                open_list_style_name = None;
             }
-            ParagraphKind::Heading { outline_level } => {
-                xml.push_str(&format!(
-                    "      <text:h text:style-name=\"{}\" text:outline-level=\"{}\">",
-                    encode_xml_text(&paragraph.style.style_name),
-                    outline_level.max(1)
-                ));
-                xml.push_str(&paragraph.xml);
-                xml.push_str("</text:h>\n");
-            }
+            xml.push_str("      ");
+            xml.push_str(&export_paragraph_xml(&ExportParagraph::empty(
+                String::new(),
+                plain_paragraph_style_after_list_item(paragraph.style),
+            )));
+            xml.push('\n');
+            continue;
         }
+
+        if open_list_style_name != paragraph_list_style_name {
+            if open_list_style_name.is_some() {
+                xml.push_str("      </text:list>\n");
+            }
+            if let Some(list_style_name) = &paragraph_list_style_name {
+                xml.push_str(&format!(
+                    "      <text:list text:style-name=\"{}\">\n",
+                    encode_xml_text(list_style_name)
+                ));
+            }
+            open_list_style_name = paragraph_list_style_name.clone();
+        }
+
+        if paragraph_list_style_name.is_some() {
+            xml.push_str("        <text:list-item>");
+            xml.push_str(&export_paragraph_xml(&paragraph));
+            xml.push_str("</text:list-item>\n");
+        } else {
+            xml.push_str("      ");
+            xml.push_str(&export_paragraph_xml(&paragraph));
+            xml.push('\n');
+        }
+    }
+    if open_list_style_name.is_some() {
+        xml.push_str("      </text:list>\n");
     }
 
     xml.push_str("    </office:text>\n  </office:body>\n</office:document-content>\n");
     xml
+}
+
+fn export_paragraph_xml(paragraph: &ExportParagraph) -> String {
+    match paragraph.style.kind {
+        ParagraphKind::Body => format!(
+            "<text:p text:style-name=\"{}\">{}</text:p>",
+            encode_xml_text(&paragraph.style.style_name),
+            paragraph.xml,
+        ),
+        ParagraphKind::Heading { outline_level } => format!(
+            "<text:h text:style-name=\"{}\" text:outline-level=\"{}\">{}</text:h>",
+            encode_xml_text(&paragraph.style.style_name),
+            outline_level.max(1),
+            paragraph.xml,
+        ),
+    }
+}
+
+fn export_list_item_is_empty(paragraph: &ExportParagraph) -> bool {
+    let mut payload = paragraph.xml.trim();
+    while let Some(remaining_payload) = payload.strip_prefix("<text:tab/>") {
+        payload = remaining_payload.trim_start();
+    }
+    payload.is_empty()
+}
+
+fn plain_paragraph_style_after_list_item(mut style: ParagraphStyle) -> ParagraphStyle {
+    while let Some(base_name) = style.style_name.strip_suffix("LroListItem") {
+        style.style_name = base_name.to_owned();
+    }
+    style.list_style_name = None;
+    style.list_marker = None;
+    style.list_number = None;
+    if style.margin_bottom == 0.0 {
+        style.margin_bottom = ParagraphStyle::default().margin_bottom;
+    }
+    style
 }
 
 fn export_paragraphs(
@@ -1352,6 +1560,14 @@ fn export_paragraphs(
         .unwrap_or_else(ParagraphStyle::default);
 
     while index < chars.len() {
+        if !paragraph_has_content {
+            if let Some(prefix_len) = export_list_prefix_len(&chars[index..], &current_paragraph_style)
+            {
+                index += prefix_len;
+                continue;
+            }
+        }
+
         let entry = &chars[index];
         if entry.value == '\n' {
             let mut newline_count = 1;
@@ -1361,17 +1577,56 @@ fn export_paragraphs(
             }
 
             flush_export_run(&mut paragraph_xml, &mut run_text, &mut run_style, styles);
-            if paragraph_has_content && newline_count == 1 {
+            let next_paragraph_style = chars
+                .get(index + newline_count)
+                .map(|entry| entry.paragraph_style.clone());
+            let entering_list_block = paragraph_has_content
+                && newline_count == 1
+                && current_paragraph_style.list_marker.is_none()
+                && next_paragraph_style
+                    .as_ref()
+                    .is_some_and(|style| style.list_marker.is_some());
+            if paragraph_has_content
+                && newline_count == 1
+                && current_paragraph_style.list_marker.is_none()
+                && next_paragraph_style
+                    .as_ref()
+                    .is_none_or(|style| style.list_marker.is_none())
+            {
                 paragraph_xml.push_str("<text:line-break/>");
                 paragraph_chars.push(entry.clone());
             } else {
-                paragraphs.push(ExportParagraph::from_content(
-                    std::mem::take(&mut paragraph_xml),
-                    &paragraph_chars,
-                    current_paragraph_style.clone(),
-                ));
+                let current_is_list_block = current_paragraph_style.list_marker.is_some();
+                let paragraph_style = if entering_list_block {
+                    paragraph_style_before_generated_list(current_paragraph_style.clone())
+                } else if current_is_list_block {
+                    paragraph_style_for_generated_list_item(current_paragraph_style.clone())
+                } else {
+                    current_paragraph_style.clone()
+                };
+                if paragraph_has_content || !current_is_list_block {
+                    paragraphs.push(if entering_list_block || current_is_list_block {
+                        ExportParagraph::empty(
+                            std::mem::take(&mut paragraph_xml),
+                            paragraph_style,
+                        )
+                    } else {
+                        ExportParagraph::from_content(
+                            std::mem::take(&mut paragraph_xml),
+                            &paragraph_chars,
+                            paragraph_style,
+                        )
+                    });
+                } else {
+                    paragraph_xml.clear();
+                }
                 paragraph_chars.clear();
-                let empty_paragraph_start = if paragraph_has_content { 2 } else { 1 };
+                let empty_paragraph_start =
+                    if paragraph_has_content && current_paragraph_style.list_marker.is_none() {
+                        2
+                    } else {
+                        1
+                    };
                 for offset in empty_paragraph_start..newline_count {
                     paragraphs.push(ExportParagraph::empty(
                         String::new(),
@@ -1379,8 +1634,8 @@ fn export_paragraphs(
                     ));
                 }
                 paragraph_has_content = false;
-                if let Some(next_entry) = chars.get(index + newline_count) {
-                    current_paragraph_style = next_entry.paragraph_style.clone();
+                if let Some(next_style) = next_paragraph_style {
+                    current_paragraph_style = next_style;
                 } else {
                     current_paragraph_style = entry.paragraph_style.clone();
                 }
@@ -1432,11 +1687,16 @@ fn export_paragraphs(
 
     flush_export_run(&mut paragraph_xml, &mut run_text, &mut run_style, styles);
     if paragraph_has_content || paragraphs.is_empty() {
-        paragraphs.push(ExportParagraph::from_content(
-            paragraph_xml,
-            &paragraph_chars,
-            current_paragraph_style,
-        ));
+        let paragraph_style = if current_paragraph_style.list_marker.is_some() {
+            paragraph_style_for_generated_list_item(current_paragraph_style)
+        } else {
+            current_paragraph_style
+        };
+        paragraphs.push(if paragraph_style.list_marker.is_some() {
+            ExportParagraph::empty(paragraph_xml, paragraph_style)
+        } else {
+            ExportParagraph::from_content(paragraph_xml, &paragraph_chars, paragraph_style)
+        });
     }
 
     if paragraphs.is_empty() {
@@ -1447,6 +1707,51 @@ fn export_paragraphs(
     }
 
     paragraphs
+}
+
+fn paragraph_style_before_generated_list(mut style: ParagraphStyle) -> ParagraphStyle {
+    style.style_name = format!("{}LroBeforeList", style.style_name);
+    style.margin_bottom = 0.0;
+    style
+}
+
+fn paragraph_style_for_generated_list_item(mut style: ParagraphStyle) -> ParagraphStyle {
+    style.style_name = format!("{}LroListItem", style.style_name);
+    style.margin_top = 0.0;
+    style.margin_bottom = 0.0;
+    style
+}
+
+fn export_list_prefix_len(chars: &[StyledChar], paragraph_style: &ParagraphStyle) -> Option<usize> {
+    let mut index = 0;
+    if paragraph_style.list_marker.is_none() || chars.get(index)?.value != '\t' {
+        return None;
+    }
+    index += 1;
+
+    if paragraph_style.list_number.is_some() {
+        let digits_start = index;
+        while chars
+            .get(index)
+            .is_some_and(|entry| entry.value.is_ascii_digit())
+        {
+            index += 1;
+        }
+        if index == digits_start {
+            return None;
+        }
+    }
+
+    if chars.get(index)?.value != paragraph_style.list_marker? {
+        return None;
+    }
+    index += 1;
+
+    if chars.get(index)?.value != '\t' {
+        return None;
+    }
+
+    Some(index + 1)
 }
 
 #[derive(Debug, Clone)]
@@ -1603,10 +1908,12 @@ fn style_color_hex(color: Color32) -> String {
 mod tests {
     use super::{
         export_content_xml, export_manifest_xml, export_styles_xml, extract_document_content,
-        load_document_from_odt, save_document_to_odt, StyleRegistry,
+        load_document_from_odt, read_zip_entry, save_document_to_odt, StyleRegistry,
+        CONTENT_XML_ENTRY,
     };
     use crate::rich_textbox::{
-        InlineStyle, ParagraphAlignment, ParagraphKind, ParagraphStyle, StyledChar,
+        InlineStyle, ParagraphAlignment, ParagraphKind, ParagraphStyle, RichTextBoxState,
+        StyledChar,
         EMBEDDED_IMAGE_OBJECT_CHAR, SOFT_PAGE_BREAK_CHAR,
     };
     use eframe::egui::Color32;
@@ -1618,10 +1925,10 @@ mod tests {
         let content = r#"
             <office:document-content>
               <office:body>
-                <office:text>
-                  <text:h text:outline-level="2">Title</text:h>
-                  <text:p><text:span>Alpha</text:span> beta</text:p>
-                  <text:p><draw:frame svg:width="5.3335in" svg:height="3.4835in"><draw:image xlink:href="Pictures/100000010000064000000415BF42DFC3.png"/></draw:frame></text:p>
+                  <office:text>
+                    <text:h text:outline-level="2">Title</text:h>
+                    <text:p><text:span>Alpha</text:span> beta</text:p>
+                  <text:p><draw:frame svg:width="5.3335in" svg:height="3.4835in"><draw:image xlink:href="Pictures/liberustoffice-image-1.png"/></draw:frame></text:p>
                   <text:p><text:soft-page-break/>After break</text:p>
                 </office:text>
               </office:body>
@@ -1720,7 +2027,9 @@ mod tests {
         assert!(text.contains("LibeRustOffice"));
         assert!(text.contains("•\tItem 1"));
         assert!(document.chars.iter().any(|entry| {
-            entry.paragraph_style.list_style_name.as_deref() == Some("L1")
+            entry.value == '•'
+                && entry.paragraph_style.list_style_name.as_deref()
+                    == Some("LroBulletList")
                 && entry.paragraph_style.list_marker == Some('•')
         }));
         assert!(text.contains(EMBEDDED_IMAGE_OBJECT_CHAR));
@@ -2007,6 +2316,226 @@ mod tests {
         assert!(styles_xml.contains("fo:text-align=\"justify\""));
         assert!(content_xml.contains("<text:h text:style-name=\"P3\" text:outline-level=\"2\">"));
         assert!(content_xml.contains("<text:p text:style-name=\"P5\">Bo</text:p>"));
+    }
+
+    #[test]
+    fn exports_and_reloads_bullet_lists_as_list_blocks() {
+        let list_style = ParagraphStyle {
+            list_style_name: Some("LroBulletList".to_owned()),
+            list_marker: Some('•'),
+            ..ParagraphStyle::default()
+        };
+        let export_path = std::env::temp_dir().join(format!(
+            "liberustoffice_export_bullet_list_test_{}.odt",
+            std::process::id()
+        ));
+        let chars = vec![
+            StyledChar::new('\t', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('•', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('A', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('\n', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('•', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('B', InlineStyle::default(), list_style),
+        ];
+
+        let styles_xml = export_styles_xml(&chars);
+        let content_xml = export_content_xml(&chars, &[]);
+        assert!(styles_xml.contains("<text:list-style style:name=\"LroBulletList\">"));
+        assert!(content_xml.contains("<text:list text:style-name=\"LroBulletList\">"));
+        assert!(content_xml.contains("<text:list-item><text:p text:style-name=\"LroBodyLroListItem\">A</text:p></text:list-item>"));
+        assert!(!content_xml.contains("<text:tab/>•<text:tab/>"));
+
+        save_document_to_odt(&export_path, &chars, &[]).expect("bullet list document should save");
+        let reloaded = load_document_from_odt(&export_path).expect("saved bullet list should reopen");
+        let _ = fs::remove_file(&export_path);
+
+        let text = reloaded
+            .chars
+            .iter()
+            .map(|entry| entry.value)
+            .collect::<String>();
+        assert_eq!(text, "\t•\tA\n\t•\tB");
+        assert!(reloaded.chars.iter().any(|entry| {
+            entry.value == '•' && entry.paragraph_style.list_style_name.as_deref() == Some("LroBulletList")
+        }));
+
+        let mut state = RichTextBoxState::from_styled_document(reloaded.chars, reloaded.images);
+        assert!(state.active_bullet_list());
+
+        state.insert_char('\n');
+
+        assert_eq!(state.plain_text(), "\t•\tA\n\t•\tB\n\t•\t");
+        assert!(state.active_bullet_list());
+        assert_eq!(
+            state
+                .chars
+                .last()
+                .and_then(|entry| entry.paragraph_style.list_style_name.as_deref()),
+            Some("LroBulletList")
+        );
+    }
+
+    #[test]
+    fn saves_tab_prefixed_bullet_lines_as_real_text_lists() {
+        let paragraph_style = ParagraphStyle {
+            style_name: "P14".to_owned(),
+            ..ParagraphStyle::default()
+        };
+        let export_path = std::env::temp_dir().join(format!(
+            "liberustoffice_export_plain_bullet_prefix_test_{}.odt",
+            std::process::id()
+        ));
+        let chars = "Sample Bulletpoint:\n\t•\tItem 1\n\t•\tItem 2"
+            .chars()
+            .map(|value| StyledChar::new(value, InlineStyle::default(), paragraph_style.clone()))
+            .collect::<Vec<_>>();
+
+        let content_xml = export_content_xml(&chars, &[]);
+        assert!(content_xml.contains(
+            "<text:p text:style-name=\"P14LroBeforeList\">Sample Bulletpoint:</text:p>"
+        ));
+        assert!(content_xml.contains("<text:list text:style-name=\"LroBulletList\">"));
+        assert!(content_xml.contains("<text:list-item><text:p text:style-name=\"P14LroListItem\">Item 1</text:p></text:list-item>"));
+        assert!(content_xml.contains("<text:list-item><text:p text:style-name=\"P14LroListItem\">Item 2</text:p></text:list-item>"));
+        assert!(!content_xml.contains("<text:list-item><text:p text:style-name=\"P14LroListItem\"></text:p></text:list-item>"));
+        assert!(!content_xml.contains("<text:tab/>•<text:tab/>"));
+
+        save_document_to_odt(&export_path, &chars, &[])
+            .expect("plain bullet prefixes should save as list blocks");
+        let saved_content_xml = read_zip_entry(&export_path, CONTENT_XML_ENTRY)
+            .expect("saved content.xml should be readable");
+        let _ = fs::remove_file(&export_path);
+
+        assert!(saved_content_xml.contains("<text:list text:style-name=\"LroBulletList\">"));
+        assert!(saved_content_xml
+            .contains("<text:list-item><text:p text:style-name=\"P14LroListItem\">Item 1</text:p></text:list-item>"));
+        assert!(!saved_content_xml
+            .contains("<text:list-item><text:p text:style-name=\"P14LroListItem\"></text:p></text:list-item>"));
+        assert!(!saved_content_xml.contains("<text:tab/>•<text:tab/>"));
+    }
+
+    #[test]
+    fn skips_trailing_whitespace_only_list_items_on_save() {
+        let list_style = ParagraphStyle {
+            list_style_name: Some("LroBulletList".to_owned()),
+            list_marker: Some('•'),
+            ..ParagraphStyle::default()
+        };
+        let body_style = ParagraphStyle {
+            style_name: "P14".to_owned(),
+            ..ParagraphStyle::default()
+        };
+        let chars = vec![
+            StyledChar::new('\t', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('•', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('A', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('\n', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_style),
+            StyledChar::new('\n', InlineStyle::default(), body_style.clone()),
+            StyledChar::new('B', InlineStyle::default(), body_style),
+        ];
+
+        let content_xml = export_content_xml(&chars, &[]);
+
+        assert!(content_xml.contains(
+            "<text:list-item><text:p text:style-name=\"LroBodyLroListItem\">A</text:p></text:list-item>"
+        ));
+        assert!(!content_xml.contains(
+            "<text:list-item><text:p text:style-name=\"LroBodyLroListItem\"><text:tab/><text:tab/></text:p></text:list-item>"
+        ));
+        assert!(content_xml.contains(
+            "</text:list>\n      <text:p text:style-name=\"LroBody\"></text:p>\n      <text:p text:style-name=\"P14\">B</text:p>"
+        ));
+    }
+
+    #[test]
+    fn preserves_spacing_around_generated_bullet_lists() {
+        let paragraph_style = ParagraphStyle {
+            style_name: "P14".to_owned(),
+            margin_bottom: 9.3312,
+            ..ParagraphStyle::default()
+        };
+        let chars = "Sample Bulletpoint:\n\t•\tItem 1\n\t•\tItem 2\n\nAfter"
+            .chars()
+            .map(|value| StyledChar::new(value, InlineStyle::default(), paragraph_style.clone()))
+            .collect::<Vec<_>>();
+
+        let styles_xml = export_styles_xml(&chars);
+        let content_xml = export_content_xml(&chars, &[]);
+
+        assert!(styles_xml.contains("style:name=\"P14LroBeforeList\""));
+        assert!(styles_xml.contains("style:name=\"P14LroListItem\""));
+        assert!(styles_xml.contains(
+            "<style:paragraph-properties fo:text-align=\"start\" fo:margin-top=\"0.0000in\" fo:margin-bottom=\"0.0000in\""
+        ));
+        assert!(content_xml
+            .contains("<text:p text:style-name=\"P14LroBeforeList\">Sample Bulletpoint:</text:p>"));
+        assert!(content_xml.contains("<text:list text:style-name=\"LroBulletList\">"));
+        assert!(content_xml.contains(
+            "<text:list-item><text:p text:style-name=\"P14LroListItem\">Item 1</text:p></text:list-item>"
+        ));
+        assert!(content_xml.contains(
+            "</text:list>\n      <text:p text:style-name=\"P14\"></text:p>\n      <text:p text:style-name=\"P14\">After</text:p>"
+        ));
+    }
+
+    #[test]
+    fn exports_and_reloads_numbered_lists_as_list_blocks() {
+        let first_item_style = ParagraphStyle {
+            list_style_name: Some("LroNumberedList".to_owned()),
+            list_marker: Some('.'),
+            list_number: Some(1),
+            ..ParagraphStyle::default()
+        };
+        let second_item_style = ParagraphStyle {
+            list_number: Some(2),
+            ..first_item_style.clone()
+        };
+        let export_path = std::env::temp_dir().join(format!(
+            "liberustoffice_export_numbered_list_test_{}.odt",
+            std::process::id()
+        ));
+        let chars = vec![
+            StyledChar::new('\t', InlineStyle::default(), first_item_style.clone()),
+            StyledChar::new('1', InlineStyle::default(), first_item_style.clone()),
+            StyledChar::new('.', InlineStyle::default(), first_item_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), first_item_style.clone()),
+            StyledChar::new('A', InlineStyle::default(), first_item_style.clone()),
+            StyledChar::new('\n', InlineStyle::default(), first_item_style),
+            StyledChar::new('\t', InlineStyle::default(), second_item_style.clone()),
+            StyledChar::new('2', InlineStyle::default(), second_item_style.clone()),
+            StyledChar::new('.', InlineStyle::default(), second_item_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), second_item_style.clone()),
+            StyledChar::new('B', InlineStyle::default(), second_item_style),
+        ];
+
+        let styles_xml = export_styles_xml(&chars);
+        let content_xml = export_content_xml(&chars, &[]);
+        assert!(styles_xml.contains("<text:list-level-style-number text:level=\"1\" text:start-value=\"1\" style:num-suffix=\".\"/>"));
+        assert!(content_xml.contains("<text:list text:style-name=\"LroNumberedList\">"));
+        assert!(content_xml.contains("<text:list-item><text:p text:style-name=\"LroBodyLroListItem\">B</text:p></text:list-item>"));
+
+        save_document_to_odt(&export_path, &chars, &[])
+            .expect("numbered list document should save");
+        let reloaded =
+            load_document_from_odt(&export_path).expect("saved numbered list should reopen");
+        let _ = fs::remove_file(&export_path);
+
+        let text = reloaded
+            .chars
+            .iter()
+            .map(|entry| entry.value)
+            .collect::<String>();
+        assert_eq!(text, "\t1.\tA\n\t2.\tB");
+        assert!(reloaded
+            .chars
+            .iter()
+            .any(|entry| entry.paragraph_style.list_number == Some(2)));
     }
 }
 fn resolve_export_target_path(path: &Path) -> Result<PathBuf, OdtSaveError> {
