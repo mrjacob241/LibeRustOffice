@@ -32,6 +32,8 @@ const TOOLBAR_HOVER_EXPAND: f32 = 2.0;
 const LINE_BOTTOM_PADDING: f32 = 3.0;
 const ROW_Y_EPSILON: f32 = 2.0;
 const EMBEDDED_IMAGE_GAP_Y: f32 = 18.0;
+const IMAGE_SELECTION_STROKE_WIDTH: f32 = 1.8;
+const IMAGE_SELECTION_HANDLE_RADIUS: f32 = 4.5;
 const MIN_FONT_SIZE_PT: f32 = 9.0;
 const MAX_FONT_SIZE_PT: f32 = 27.0;
 pub const EMBEDDED_IMAGE_OBJECT_CHAR: char = '\u{FFFC}';
@@ -365,6 +367,38 @@ impl RichTextBoxState {
         Some(anchor.min(focus)..anchor.max(focus))
     }
 
+    pub fn select_image_object(&mut self, image_char_index: usize) {
+        let start = image_char_index.min(self.chars.len());
+        let end = (start + 1).min(self.chars.len());
+        self.selection_anchor = Some(start);
+        self.selection_focus = Some(end);
+        self.cursor_index = end;
+    }
+
+    pub fn selected_image(&self) -> Option<(usize, &DocumentImage)> {
+        let selection_range = self.selected_range()?;
+        if selection_range.len() != 1 {
+            return None;
+        }
+
+        let char_index = selection_range.start;
+        if self.chars.get(char_index)?.value != EMBEDDED_IMAGE_OBJECT_CHAR {
+            return None;
+        }
+
+        let image_index = self
+            .chars
+            .iter()
+            .take(char_index + 1)
+            .filter(|entry| entry.value == EMBEDDED_IMAGE_OBJECT_CHAR)
+            .count()
+            .saturating_sub(1);
+
+        self.images
+            .get(image_index)
+            .map(|image| (image_index, image))
+    }
+
     pub fn toggle_bold(&mut self) {
         let new_value = !self.active_bold();
         self.typing_style.bold = new_value;
@@ -628,6 +662,10 @@ impl RenderBox {
         matches!(self.kind, RenderBoxKind::TextChar { .. })
     }
 
+    fn is_image(self) -> bool {
+        matches!(self.kind, RenderBoxKind::Image { .. })
+    }
+
     fn paint(self, ui: &Ui, entry: &StyledChar) {
         if self.is_line_break() {
             return;
@@ -791,14 +829,26 @@ impl Widget for RichTextBox<'_> {
                         );
 
                         if let Some(pointer_pos) = response.interact_pointer_pos() {
-                            let hit_index = nearest_cursor_index(&hit_test_layout, pointer_pos);
+                            let hit_image_char_index =
+                                hit_test_image_char_index(&hit_test_layout, pointer_pos);
+                            let hit_index = hit_image_char_index.unwrap_or_else(|| {
+                                nearest_cursor_index(&hit_test_layout, pointer_pos)
+                            });
                             if response.drag_started() {
-                                self.state.set_selection_point(hit_index);
+                                if let Some(image_char_index) = hit_image_char_index {
+                                    self.state.select_image_object(image_char_index);
+                                } else {
+                                    self.state.set_selection_point(hit_index);
+                                }
                             } else if response.dragged() {
                                 self.state.drag_selection_to(hit_index);
                             } else if response.clicked() {
-                                self.state.cursor_index = hit_index;
-                                self.state.clear_selection();
+                                if let Some(image_char_index) = hit_image_char_index {
+                                    self.state.select_image_object(image_char_index);
+                                } else {
+                                    self.state.cursor_index = hit_index;
+                                    self.state.clear_selection();
+                                }
                             }
                         }
 
@@ -1716,6 +1766,20 @@ fn nearest_cursor_index(layout: &LaidOutDocument, pointer_pos: Pos2) -> usize {
     best_index
 }
 
+fn hit_test_image_char_index(layout: &LaidOutDocument, pointer_pos: Pos2) -> Option<usize> {
+    layout
+        .render_boxes
+        .iter()
+        .find_map(|render_box| match render_box.kind {
+            RenderBoxKind::Image { char_index, .. }
+                if render_box.visual_rect().contains(pointer_pos) =>
+            {
+                Some(char_index)
+            }
+            _ => None,
+        })
+}
+
 fn nearest_vertical_cursor_index(
     layout: &LaidOutDocument,
     cursor_index: usize,
@@ -1819,6 +1883,17 @@ fn paint_document(
         }
     }
 
+    if let Some(selection_range) = state.selected_range() {
+        for render_box in &layout.render_boxes {
+            let Some(char_index) = render_box.char_index() else {
+                continue;
+            };
+            if selection_range.contains(&char_index) && render_box.is_image() {
+                paint_image_selection_overlay(ui, render_box.visual_rect());
+            }
+        }
+    }
+
     let cursor_pos = layout
         .cursor_points
         .get(state.cursor_index)
@@ -1838,6 +1913,37 @@ fn paint_document(
         FontId::new(12.0, FontFamily::Proportional),
         Color32::GRAY,
     );
+}
+
+fn paint_image_selection_overlay(ui: &Ui, image_rect: Rect) {
+    let stroke_color = Color32::from_rgb(20, 120, 220);
+    ui.painter().rect_stroke(
+        image_rect,
+        0.0,
+        Stroke::new(IMAGE_SELECTION_STROKE_WIDTH, stroke_color),
+    );
+
+    let handle_points = [
+        image_rect.left_top(),
+        image_rect.center_top(),
+        image_rect.right_top(),
+        image_rect.right_center(),
+        image_rect.right_bottom(),
+        image_rect.center_bottom(),
+        image_rect.left_bottom(),
+        image_rect.left_center(),
+        image_rect.center(),
+    ];
+
+    for handle_point in handle_points {
+        ui.painter()
+            .circle_filled(handle_point, IMAGE_SELECTION_HANDLE_RADIUS, Color32::WHITE);
+        ui.painter().circle_stroke(
+            handle_point,
+            IMAGE_SELECTION_HANDLE_RADIUS,
+            Stroke::new(1.4, stroke_color),
+        );
+    }
 }
 
 fn paint_page_backgrounds(ui: &Ui, layout: &LaidOutDocument, canvas_rect: Rect) {

@@ -25,6 +25,7 @@ enum LeftPanelTab {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightPanelTab {
     Properties,
+    Image,
     Scheduler,
 }
 
@@ -256,6 +257,11 @@ impl LibeRustOfficeApp {
                         );
                         ui.selectable_value(
                             &mut self.right_panel_tab,
+                            RightPanelTab::Image,
+                            "Image",
+                        );
+                        ui.selectable_value(
+                            &mut self.right_panel_tab,
                             RightPanelTab::Scheduler,
                             "Scheduler",
                         );
@@ -294,6 +300,60 @@ impl LibeRustOfficeApp {
                             ));
                             ui.separator();
                             ui.label("Additional object/style settings can be added here.");
+                        }
+                        RightPanelTab::Image => {
+                            if let Some((image_index, image)) = self.editor.selected_image() {
+                                ui.label(format!("Selected image #{image_index}"));
+                                draw_readonly_text_field(
+                                    ui,
+                                    "Path",
+                                    &image.path.display().to_string(),
+                                );
+                                draw_readonly_text_field(
+                                    ui,
+                                    "Width",
+                                    &format!("{:.1}", image.size.x),
+                                );
+                                draw_readonly_text_field(
+                                    ui,
+                                    "Height",
+                                    &format!("{:.1}", image.size.y),
+                                );
+                                draw_readonly_text_field(
+                                    ui,
+                                    "Margin L",
+                                    &format!("{:.1}", image.margin_left),
+                                );
+                                draw_readonly_text_field(
+                                    ui,
+                                    "Margin R",
+                                    &format!("{:.1}", image.margin_right),
+                                );
+                                draw_readonly_text_field(
+                                    ui,
+                                    "Margin T",
+                                    &format!("{:.1}", image.margin_top),
+                                );
+                                draw_readonly_text_field(
+                                    ui,
+                                    "Margin B",
+                                    &format!("{:.1}", image.margin_bottom),
+                                );
+                                draw_readonly_text_field(
+                                    ui,
+                                    "Centered",
+                                    if image.center_horizontally {
+                                        "true"
+                                    } else {
+                                        "false"
+                                    },
+                                );
+                            } else {
+                                ui.label("No image selected");
+                                ui.label(
+                                    "Click an image in the document to inspect its parameters.",
+                                );
+                            }
                         }
                         RightPanelTab::Scheduler => {
                             ui.label("Scheduler presets");
@@ -385,6 +445,12 @@ fn open_document_or_fallback(path: impl AsRef<Path>) -> Result<RichTextBoxState,
 
 fn empty_menu(ui: &mut egui::Ui, label: &str) {
     ui.menu_button(label, |_ui| {});
+}
+
+fn draw_readonly_text_field(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.label(label);
+    let mut text = value.to_owned();
+    ui.add_enabled(false, egui::TextEdit::singleline(&mut text));
 }
 
 fn document_name_from_path(path: impl AsRef<Path>) -> String {
