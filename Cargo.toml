@@ -1,0 +1,9 @@
+[package]
+name = "libe_rust_office"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
+rfd = "0.14"
