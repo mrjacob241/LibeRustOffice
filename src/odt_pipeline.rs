@@ -31,6 +31,12 @@ const SPAN_CLOSE_TAG: &str = "</text:span>";
 const DRAW_FRAME_OPEN_TAG: &str = "<draw:frame";
 const DRAW_FRAME_CLOSE_TAG: &str = "</draw:frame>";
 const DRAW_IMAGE_TAG: &str = "<draw:image";
+const LIST_OPEN_TAG: &str = "<text:list";
+const LIST_CLOSE_TAG: &str = "</text:list>";
+const LIST_STYLE_OPEN_TAG: &str = "<text:list-style";
+const LIST_STYLE_CLOSE_TAG: &str = "</text:list-style>";
+const LIST_LEVEL_BULLET_TAG: &str = "<text:list-level-style-bullet";
+const LIST_LEVEL_NUMBER_TAG: &str = "<text:list-level-style-number";
 const LINE_BREAK_TAG: &str = "<text:line-break/>";
 const TAB_TAG: &str = "<text:tab/>";
 const SOFT_PAGE_BREAK_TAG: &str = "<text:soft-page-break/>";
@@ -128,6 +134,7 @@ struct StyleRegistry {
     default_paragraph_style: ParagraphStyle,
     default_graphic_style: GraphicStyle,
     styles: HashMap<String, StyleDefinition>,
+    list_styles: HashMap<String, ListStyleDefinition>,
     resolved_styles: HashMap<String, InlineStyle>,
     resolved_graphic_styles: HashMap<String, GraphicStyle>,
 }
@@ -139,6 +146,19 @@ struct GraphicStyle {
     margin_top: f32,
     margin_bottom: f32,
     center_horizontally: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ListStyleDefinition {
+    marker: char,
+    start_number: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveListState {
+    style_name: String,
+    marker: char,
+    next_number: Option<u32>,
 }
 
 pub struct OdtDocument {
@@ -214,6 +234,7 @@ impl StyleRegistry {
             default_paragraph_style: ParagraphStyle::default(),
             default_graphic_style: GraphicStyle::default(),
             styles: HashMap::new(),
+            list_styles: HashMap::new(),
             resolved_styles: HashMap::new(),
             resolved_graphic_styles: HashMap::new(),
         };
@@ -221,6 +242,8 @@ impl StyleRegistry {
         registry.read_default_style(styles_xml);
         registry.read_style_definitions(styles_xml);
         registry.read_style_definitions(content_xml);
+        registry.read_list_styles(styles_xml);
+        registry.read_list_styles(content_xml);
         registry
     }
 
@@ -303,6 +326,37 @@ impl StyleRegistry {
             apply_graphic_properties_to_definition(&mut definition, body);
             self.styles.insert(style_name, definition);
             cursor = close_start + STYLE_CLOSE_TAG.len();
+        }
+    }
+
+    fn read_list_styles(&mut self, xml: &str) {
+        let mut cursor = 0;
+        while let Some(style_start) = xml[cursor..].find(LIST_STYLE_OPEN_TAG) {
+            let open_start = cursor + style_start;
+            let Some(open_end) = xml[open_start..]
+                .find('>')
+                .map(|offset| open_start + offset + 1)
+            else {
+                break;
+            };
+            let open_tag = &xml[open_start..open_end];
+            let Some(style_name) = attribute_value(open_tag, "style:name") else {
+                cursor = open_end;
+                continue;
+            };
+            let Some(close_start) = xml[open_end..]
+                .find(LIST_STYLE_CLOSE_TAG)
+                .map(|offset| open_end + offset)
+            else {
+                break;
+            };
+            let body = &xml[open_end..close_start];
+
+            if let Some(list_style) = parse_list_style_definition(body) {
+                self.list_styles.insert(style_name, list_style);
+            }
+
+            cursor = close_start + LIST_STYLE_CLOSE_TAG.len();
         }
     }
 
@@ -513,6 +567,7 @@ fn extract_document_content(
     let mut current_paragraph_style = styles.default_paragraph_style.clone();
     let mut last_closed_block_had_content = false;
     let mut pending_frame: Option<PendingFrame> = None;
+    let mut list_stack: Vec<ActiveListState> = Vec::new();
     let mut style_stack = vec![styles.default_style];
 
     while let Some(relative_start) = content_xml[cursor..].find('<') {
@@ -532,7 +587,29 @@ fn extract_document_content(
         let tag_end = tag_start + relative_end + 1;
         let tag = &content_xml[tag_start..tag_end];
 
-        if tag.starts_with(PARAGRAPH_OPEN_TAG) || tag.starts_with(HEADING_OPEN_TAG) {
+        if tag.starts_with(LIST_OPEN_TAG) && !tag.starts_with(LIST_STYLE_OPEN_TAG) {
+            let list_style_name = attribute_value(tag, "text:style-name");
+            if let Some((style_name, list_style)) = list_style_name
+                .as_deref()
+                .and_then(|style_name| {
+                    styles
+                        .list_styles
+                        .get(style_name)
+                        .copied()
+                        .map(|list_style| (style_name.to_owned(), list_style))
+                })
+            {
+                list_stack.push(ActiveListState {
+                    style_name,
+                    marker: list_style.marker,
+                    next_number: list_style.start_number,
+                });
+            }
+        } else if tag == LIST_CLOSE_TAG {
+            if !list_stack.is_empty() {
+                list_stack.pop();
+            }
+        } else if tag.starts_with(PARAGRAPH_OPEN_TAG) || tag.starts_with(HEADING_OPEN_TAG) {
             if !chars.is_empty() && chars.last().is_some_and(|entry| entry.value != '\n') {
                 chars.push(StyledChar::new(
                     '\n',
@@ -555,9 +632,45 @@ fn extract_document_content(
                 attribute_value(tag, "text:style-name").as_deref(),
                 block_kind,
             );
+            if let Some(list_state) = list_stack.last_mut() {
+                current_paragraph_style.list_style_name = Some(list_state.style_name.clone());
+                current_paragraph_style.list_marker = Some(list_state.marker);
+                current_paragraph_style.list_number = list_state.next_number;
+                if let Some(next_number) = list_state.next_number.as_mut() {
+                    *next_number = next_number.saturating_add(1);
+                }
+            }
             style_stack.clear();
             style_stack.push(current_block_style);
             current_block_has_content = false;
+
+            if let Some(list_marker) = current_paragraph_style.list_marker {
+                chars.push(StyledChar::new(
+                    '\t',
+                    current_block_style,
+                    current_paragraph_style.clone(),
+                ));
+                if let Some(list_number) = current_paragraph_style.list_number {
+                    for digit in list_number.to_string().chars() {
+                        chars.push(StyledChar::new(
+                            digit,
+                            current_block_style,
+                            current_paragraph_style.clone(),
+                        ));
+                    }
+                }
+                chars.push(StyledChar::new(
+                    list_marker,
+                    current_block_style,
+                    current_paragraph_style.clone(),
+                ));
+                chars.push(StyledChar::new(
+                    '\t',
+                    current_block_style,
+                    current_paragraph_style.clone(),
+                ));
+                current_block_has_content = true;
+            }
 
             if tag.ends_with("/>") {
                 chars.push(StyledChar::new(
@@ -579,7 +692,7 @@ fn extract_document_content(
                 current_block_style,
                 current_paragraph_style.clone(),
             ));
-            if current_block_has_content {
+            if current_block_has_content && current_paragraph_style.list_marker.is_none() {
                 chars.push(StyledChar::new(
                     '\n',
                     current_block_style,
@@ -861,6 +974,37 @@ fn parse_underline(tag: &str) -> Option<bool> {
     attribute_value(tag, "style:text-underline-style")
         .map(|value| value != "none")
         .or_else(|| attribute_value(tag, "text:style-name").map(|_| false))
+}
+
+fn parse_list_style_definition(list_style_body: &str) -> Option<ListStyleDefinition> {
+    parse_list_bullet_style(list_style_body).or_else(|| parse_list_number_style(list_style_body))
+}
+
+fn parse_list_bullet_style(list_style_body: &str) -> Option<ListStyleDefinition> {
+    let tag_start = list_style_body.find(LIST_LEVEL_BULLET_TAG)?;
+    let tag_end = list_style_body[tag_start..].find('>')?;
+    let tag = &list_style_body[tag_start..tag_start + tag_end + 1];
+    let marker = attribute_value(tag, "text:bullet-char")?.chars().next()?;
+    Some(ListStyleDefinition {
+        marker,
+        start_number: None,
+    })
+}
+
+fn parse_list_number_style(list_style_body: &str) -> Option<ListStyleDefinition> {
+    let tag_start = list_style_body.find(LIST_LEVEL_NUMBER_TAG)?;
+    let tag_end = list_style_body[tag_start..].find('>')?;
+    let tag = &list_style_body[tag_start..tag_start + tag_end + 1];
+    let marker = attribute_value(tag, "style:num-suffix")
+        .and_then(|suffix| suffix.chars().last())
+        .unwrap_or('.');
+    let start_number = attribute_value(tag, "text:start-value")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    Some(ListStyleDefinition {
+        marker,
+        start_number: Some(start_number),
+    })
 }
 
 fn parse_color(tag: &str) -> Option<Color32> {
@@ -1477,7 +1621,7 @@ mod tests {
                 <office:text>
                   <text:h text:outline-level="2">Title</text:h>
                   <text:p><text:span>Alpha</text:span> beta</text:p>
-                  <text:p><draw:frame svg:width="5.3335in" svg:height="3.4835in"><draw:image xlink:href="Pictures/100000000000064000000415424CE288.jpg"/></draw:frame></text:p>
+                  <text:p><draw:frame svg:width="5.3335in" svg:height="3.4835in"><draw:image xlink:href="Pictures/100000010000064000000415BF42DFC3.png"/></draw:frame></text:p>
                   <text:p><text:soft-page-break/>After break</text:p>
                 </office:text>
               </office:body>
@@ -1573,17 +1717,22 @@ mod tests {
             .iter()
             .map(|entry| entry.value)
             .collect::<String>();
-        assert!(text.contains("Cos’è Lorem Ipsum?"));
+        assert!(text.contains("LibeRustOffice"));
+        assert!(text.contains("•\tItem 1"));
+        assert!(document.chars.iter().any(|entry| {
+            entry.paragraph_style.list_style_name.as_deref() == Some("L1")
+                && entry.paragraph_style.list_marker == Some('•')
+        }));
         assert!(text.contains(EMBEDDED_IMAGE_OBJECT_CHAR));
         assert_eq!(document.images.len(), 1);
-        assert!(document.images[0].size.x > 500.0);
-        assert!(document.images[0].size.y > 300.0);
+        assert!(document.images[0].size.x > 400.0);
+        assert!(document.images[0].size.y > 250.0);
         assert!(document.images[0].center_horizontally);
 
         let heading_char = document
             .chars
             .iter()
-            .find(|entry| entry.value == 'C')
+            .find(|entry| matches!(entry.paragraph_style.kind, ParagraphKind::Heading { .. }))
             .expect("heading text should exist");
         assert!(heading_char.style.font_size > InlineStyle::default().font_size);
         assert!(heading_char.style.bold);
@@ -1591,6 +1740,52 @@ mod tests {
             heading_char.paragraph_style.kind,
             ParagraphKind::Heading { .. }
         ));
+    }
+
+    #[test]
+    fn parses_numbered_list_prefixes_with_incrementing_numbers() {
+        let styles_xml = r#"
+            <office:document-styles>
+              <office:styles>
+                <text:list-style style:name="NumberedList">
+                  <text:list-level-style-number text:level="1" text:start-value="3" style:num-suffix="."/>
+                </text:list-style>
+              </office:styles>
+            </office:document-styles>
+        "#;
+        let content_xml = r#"
+            <office:document-content>
+              <office:body>
+                <office:text>
+                  <text:list text:style-name="NumberedList">
+                    <text:list-item><text:p>First</text:p></text:list-item>
+                    <text:list-item><text:p>Second</text:p></text:list-item>
+                  </text:list>
+                </office:text>
+              </office:body>
+            </office:document-content>
+        "#;
+        let mut styles = StyleRegistry::from_xml(styles_xml, content_xml);
+
+        let chars = extract_document_content(
+            Path::new("sample_docs/sample_text_base.odt"),
+            content_xml,
+            &mut styles,
+        )
+        .expect("numbered list content should parse")
+        .chars;
+
+        let text = chars.iter().map(|entry| entry.value).collect::<String>();
+        assert_eq!(text, "\t3.\tFirst\n\t4.\tSecond");
+        assert_eq!(chars[1].paragraph_style.list_style_name.as_deref(), Some("NumberedList"));
+        assert_eq!(chars[1].paragraph_style.list_marker, Some('.'));
+        assert_eq!(chars[1].paragraph_style.list_number, Some(3));
+
+        let second_item_number = chars
+            .iter()
+            .find(|entry| entry.value == '4')
+            .and_then(|entry| entry.paragraph_style.list_number);
+        assert_eq!(second_item_number, Some(4));
     }
 
     #[test]
@@ -1776,6 +1971,7 @@ mod tests {
             margin_left: 4.8,
             margin_right: 2.4,
             line_height_percent: Some(130.0),
+            ..ParagraphStyle::default()
         };
         let body_paragraph = ParagraphStyle {
             style_name: "P5".to_owned(),

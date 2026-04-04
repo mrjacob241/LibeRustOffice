@@ -30,6 +30,7 @@ const STATUS_BAR_TOP_GAP: f32 = 6.0;
 const STATUS_BAR_HEIGHT: f32 = 28.0;
 const TOOLBAR_HOVER_EXPAND: f32 = 2.0;
 const LINE_BOTTOM_PADDING: f32 = 3.0;
+const LIST_ITEM_BOTTOM_PADDING: f32 = 8.0;
 const ROW_Y_EPSILON: f32 = 2.0;
 const EMBEDDED_IMAGE_GAP_Y: f32 = 18.0;
 const IMAGE_SELECTION_STROKE_WIDTH: f32 = 1.8;
@@ -104,6 +105,9 @@ pub struct ParagraphStyle {
     pub margin_left: f32,
     pub margin_right: f32,
     pub line_height_percent: Option<f32>,
+    pub list_style_name: Option<String>,
+    pub list_marker: Option<char>,
+    pub list_number: Option<u32>,
 }
 
 impl Default for ParagraphStyle {
@@ -117,6 +121,9 @@ impl Default for ParagraphStyle {
             margin_left: 0.0,
             margin_right: 0.0,
             line_height_percent: Some(115.0),
+            list_style_name: None,
+            list_marker: None,
+            list_number: None,
         }
     }
 }
@@ -260,6 +267,10 @@ impl RichTextBoxState {
     }
 
     pub fn insert_char(&mut self, value: char) {
+        if value == '\n' && self.insert_list_line_break_if_any() {
+            return;
+        }
+
         self.delete_selection_if_any();
         self.chars.insert(
             self.cursor_index,
@@ -321,6 +332,10 @@ impl RichTextBoxState {
 
     pub fn delete_forward(&mut self) {
         if self.delete_selection_if_any() {
+            return;
+        }
+
+        if self.delete_empty_list_line_if_any() {
             return;
         }
 
@@ -545,6 +560,161 @@ impl RichTextBoxState {
             .map(|entry| entry.paragraph_style.clone())
             .unwrap_or_else(ParagraphStyle::default)
     }
+
+    fn delete_empty_list_line_if_any(&mut self) -> bool {
+        let line_start = self.current_line_start_index();
+        let line_end = self.current_line_end_index(line_start);
+        let Some(list_style) = self.current_line_list_style(line_start, line_end)
+        else {
+            return false;
+        };
+
+        if !line_has_only_list_prefix(&self.chars[line_start..line_end], &list_style) {
+            return false;
+        }
+
+        let mut delete_end = line_end;
+        if self
+            .chars
+            .get(delete_end)
+            .is_some_and(|entry| entry.value == '\n')
+        {
+            delete_end += 1;
+        }
+        if self
+            .chars
+            .get(delete_end)
+            .is_some_and(|entry| entry.value == '\n')
+        {
+            delete_end += 1;
+        }
+
+        self.chars.drain(line_start..delete_end);
+        self.cursor_index = line_start.min(self.chars.len());
+        if self.cursor_index > 0
+            && self
+                .chars
+                .get(self.cursor_index - 1)
+                .is_some_and(|entry| entry.value == '\n')
+        {
+            clear_paragraph_list_style(&mut self.chars[self.cursor_index - 1].paragraph_style);
+        }
+        self.clear_selection();
+        self.bump_edit_revision();
+        true
+    }
+
+    fn insert_list_line_break_if_any(&mut self) -> bool {
+        if self.delete_selection_if_any() {
+            return false;
+        }
+
+        let line_start = self.current_line_start_index();
+        let line_end = self.current_line_end_index(line_start);
+        if self.cursor_index != line_end {
+            return false;
+        }
+
+        let Some(current_style) = self.chars.get(line_start).map(|entry| {
+            entry.paragraph_style.clone()
+        }) else {
+            return false;
+        };
+        let Some(list_marker) = current_style.list_marker else {
+            return false;
+        };
+
+        if line_has_only_list_prefix(&self.chars[line_start..line_end], &current_style) {
+            let mut plain_style = current_style;
+            clear_paragraph_list_style(&mut plain_style);
+            self.chars.splice(
+                line_start..self.cursor_index,
+                [StyledChar::new('\n', self.typing_style, plain_style)],
+            );
+            self.cursor_index = line_start + 1;
+            self.clear_selection();
+            self.bump_edit_revision();
+            return true;
+        }
+
+        let next_list_number = current_style
+            .list_number
+            .map(|number| number.saturating_add(1));
+        let mut next_style = current_style.clone();
+        next_style.list_number = next_list_number;
+
+        let mut insert_chars = vec![StyledChar::new('\n', self.typing_style, current_style)];
+        insert_chars.push(StyledChar::new('\t', self.typing_style, next_style.clone()));
+        if let Some(number) = next_list_number {
+            insert_chars.extend(
+                number
+                    .to_string()
+                    .chars()
+                    .map(|value| StyledChar::new(value, self.typing_style, next_style.clone())),
+            );
+        }
+        insert_chars.push(StyledChar::new(
+            list_marker,
+            self.typing_style,
+            next_style.clone(),
+        ));
+        insert_chars.push(StyledChar::new('\t', self.typing_style, next_style));
+
+        let insert_len = insert_chars.len();
+        self.chars
+            .splice(self.cursor_index..self.cursor_index, insert_chars);
+        self.cursor_index += insert_len;
+        self.clear_selection();
+        self.bump_edit_revision();
+        true
+    }
+
+    fn current_line_start_index(&self) -> usize {
+        let mut line_start = self.cursor_index.min(self.chars.len());
+        while line_start > 0 && self.chars[line_start - 1].value != '\n' {
+            line_start -= 1;
+        }
+        line_start
+    }
+
+    fn current_line_end_index(&self, line_start: usize) -> usize {
+        let mut line_end = line_start.min(self.chars.len());
+        while line_end < self.chars.len() && self.chars[line_end].value != '\n' {
+            line_end += 1;
+        }
+        line_end
+    }
+
+    fn current_line_list_style(
+        &self,
+        line_start: usize,
+        line_end: usize,
+    ) -> Option<ParagraphStyle> {
+        self.chars
+            .get(line_start..line_end)?
+            .iter()
+            .find(|entry| entry.paragraph_style.list_marker.is_some())
+            .map(|entry| entry.paragraph_style.clone())
+    }
+}
+
+fn clear_paragraph_list_style(paragraph_style: &mut ParagraphStyle) {
+    paragraph_style.list_style_name = None;
+    paragraph_style.list_marker = None;
+    paragraph_style.list_number = None;
+}
+
+fn line_has_only_list_prefix(line_chars: &[StyledChar], list_style: &ParagraphStyle) -> bool {
+    let Some(marker) = list_style.list_marker else {
+        return false;
+    };
+
+    line_chars.iter().all(|entry| {
+        entry.value == '\t'
+            || entry.value == ' '
+            || entry.value == marker
+            || (list_style.list_number.is_some() && entry.value.is_ascii_digit())
+    })
 }
 
 impl DocumentImage {
@@ -810,6 +980,9 @@ impl Widget for RichTextBox<'_> {
                     self.state.page_scale,
                 );
                 let zoom_shortcut_changed = consume_page_zoom_shortcut(ui, self.state);
+                if self.state.editor_active {
+                    focus_editor_canvas(ui);
+                }
                 let editor_canvas_has_focus =
                     ui.memory(|memory| memory.has_focus(editor_canvas_id()));
                 let keyboard_changed = self.state.editor_active
@@ -1487,7 +1660,11 @@ fn layout_document(
 
         let glyph_size = glyph_cell_size(ui, entry.value, entry.style);
         let glyph_width = glyph_size.x;
-        let glyph_height = glyph_size.y;
+        let glyph_height = if entry.value == '\n' {
+            line_break_height(entry)
+        } else {
+            glyph_size.y
+        };
         let glyph_caret_height = entry.style.font_size;
 
         if entry.value != '\n' && pen_x > origin.x && pen_x + glyph_width > origin.x + max_width {
@@ -1778,6 +1955,15 @@ fn glyph_cell_size(ui: &Ui, value: char, style: InlineStyle) -> Vec2 {
     size
 }
 
+fn line_break_height(entry: &StyledChar) -> f32 {
+    let list_gap = if entry.paragraph_style.list_marker.is_some() {
+        LIST_ITEM_BOTTOM_PADDING
+    } else {
+        0.0
+    };
+    entry.style.font_size + LINE_BOTTOM_PADDING + list_gap
+}
+
 fn glyph_galley(ui: &Ui, value: char, style: InlineStyle) -> Arc<Galley> {
     let mut job = LayoutJob::default();
     job.append(
@@ -2054,7 +2240,9 @@ fn scroll_cursor_into_view(ui: &mut Ui, state: &RichTextBoxState, layout: &LaidO
 
 #[cfg(test)]
 mod tests {
-    use super::{InlineStyle, RichTextBoxState, StyledChar, PT_TO_PX};
+    use super::{
+        InlineStyle, ParagraphStyle, RichTextBoxState, StyledChar, PT_TO_PX,
+    };
     use eframe::egui::Color32;
 
     #[test]
@@ -2103,6 +2291,148 @@ mod tests {
         assert_eq!(state.plain_text(), "abXf");
         assert_eq!(state.cursor_index, 3);
         assert_eq!(state.selected_range(), None);
+    }
+
+    #[test]
+    fn delete_forward_removes_an_empty_bullet_line() {
+        let list_paragraph_style = ParagraphStyle {
+            list_style_name: Some("L1".to_owned()),
+            list_marker: Some('•'),
+            ..ParagraphStyle::default()
+        };
+        let body_paragraph_style = ParagraphStyle::default();
+        let mut state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('•', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('\n', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('\n', InlineStyle::default(), list_paragraph_style),
+            StyledChar::new('N', InlineStyle::default(), body_paragraph_style.clone()),
+            StyledChar::new('e', InlineStyle::default(), body_paragraph_style.clone()),
+            StyledChar::new('x', InlineStyle::default(), body_paragraph_style.clone()),
+            StyledChar::new('t', InlineStyle::default(), body_paragraph_style),
+        ]);
+        state.cursor_index = 3;
+
+        state.delete_forward();
+
+        assert_eq!(state.plain_text(), "Next");
+        assert_eq!(state.cursor_index, 0);
+        assert_eq!(state.chars[0].paragraph_style.list_marker, None);
+    }
+
+    #[test]
+    fn enter_at_end_of_bullet_line_creates_next_bullet_item() {
+        let list_paragraph_style = ParagraphStyle {
+            list_style_name: Some("L1".to_owned()),
+            list_marker: Some('•'),
+            ..ParagraphStyle::default()
+        };
+        let mut state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('•', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('I', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('e', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('m', InlineStyle::default(), list_paragraph_style),
+        ]);
+        state.cursor_index = state.chars.len();
+
+        state.insert_char('\n');
+
+        assert_eq!(state.plain_text(), "\t•\tItem\n\t•\t");
+        assert_eq!(state.cursor_index, state.chars.len());
+        assert_eq!(
+            state.chars.last().and_then(|entry| entry.paragraph_style.list_marker),
+            Some('•')
+        );
+
+        state.delete_forward();
+
+        assert_eq!(state.plain_text(), "\t•\tItem\n");
+        assert_eq!(state.cursor_index, 8);
+        assert_eq!(state.chars[7].paragraph_style.list_marker, None);
+
+        state.insert_text("Plain");
+        state.insert_char('\n');
+
+        assert_eq!(state.plain_text(), "\t•\tItem\nPlain\n");
+    }
+
+    #[test]
+    fn enter_at_end_of_numbered_line_creates_incremented_next_item() {
+        let list_paragraph_style = ParagraphStyle {
+            list_style_name: Some("L2".to_owned()),
+            list_marker: Some('.'),
+            list_number: Some(3),
+            ..ParagraphStyle::default()
+        };
+        let mut state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('3', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('.', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('I', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('e', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('m', InlineStyle::default(), list_paragraph_style),
+        ]);
+        state.cursor_index = state.chars.len();
+
+        state.insert_char('\n');
+
+        assert_eq!(state.plain_text(), "\t3.\tItem\n\t4.\t");
+        assert_eq!(state.cursor_index, state.chars.len());
+        assert_eq!(
+            state.chars.last().and_then(|entry| entry.paragraph_style.list_number),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn enter_at_end_of_empty_bullet_line_terminates_the_list() {
+        let list_paragraph_style = ParagraphStyle {
+            list_style_name: Some("L1".to_owned()),
+            list_marker: Some('•'),
+            ..ParagraphStyle::default()
+        };
+        let mut state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('•', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style),
+        ]);
+        state.cursor_index = state.chars.len();
+
+        state.insert_char('\n');
+        state.insert_text("Plain");
+
+        assert_eq!(state.plain_text(), "\nPlain");
+        assert_eq!(state.chars[0].paragraph_style.list_marker, None);
+    }
+
+    #[test]
+    fn enter_at_end_of_empty_numbered_line_terminates_the_list() {
+        let list_paragraph_style = ParagraphStyle {
+            list_style_name: Some("L2".to_owned()),
+            list_marker: Some('.'),
+            list_number: Some(7),
+            ..ParagraphStyle::default()
+        };
+        let mut state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('7', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('.', InlineStyle::default(), list_paragraph_style.clone()),
+            StyledChar::new('\t', InlineStyle::default(), list_paragraph_style),
+        ]);
+        state.cursor_index = state.chars.len();
+
+        state.insert_char('\n');
+        state.insert_text("Plain");
+
+        assert_eq!(state.plain_text(), "\nPlain");
+        assert_eq!(state.chars[0].paragraph_style.list_number, None);
+        assert_eq!(state.chars[0].paragraph_style.list_marker, None);
     }
 
     #[test]
