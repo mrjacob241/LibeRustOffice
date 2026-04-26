@@ -672,6 +672,18 @@ impl RichTextBoxState {
         self.apply_paragraph_alignment_to_range(target_range, alignment);
     }
 
+    pub fn set_active_paragraph_horizontal_margins(&mut self, margin_left: f32, margin_right: f32) {
+        let target_range = self.selected_range().unwrap_or_else(|| {
+            let line_start = self.current_line_start_index();
+            line_start..self.current_line_end_index(line_start)
+        });
+        self.apply_paragraph_horizontal_margins_to_range(
+            target_range,
+            margin_left.max(0.0),
+            margin_right.max(0.0),
+        );
+    }
+
     pub fn zoom_in_page(&mut self) {
         self.page_scale = ((self.page_scale + PAGE_SCALE_STEP) * 100.0).round() / 100.0;
         self.page_scale = self.page_scale.min(MAX_PAGE_SCALE);
@@ -730,6 +742,16 @@ impl RichTextBoxState {
                     .map(|entry| entry.paragraph_style.alignment)
             })
             .unwrap_or_else(|| self.cursor_adjacent_paragraph_style().alignment)
+    }
+
+    pub fn active_paragraph_style(&self) -> ParagraphStyle {
+        self.selected_range()
+            .and_then(|range| {
+                self.chars
+                    .get(range.start)
+                    .map(|entry| entry.paragraph_style.clone())
+            })
+            .unwrap_or_else(|| self.cursor_adjacent_paragraph_style())
     }
 
     pub fn active_bullet_list(&self) -> bool {
@@ -1193,6 +1215,43 @@ impl RichTextBoxState {
         self.bump_edit_revision();
     }
 
+    fn apply_paragraph_horizontal_margins_to_range(
+        &mut self,
+        range: Range<usize>,
+        margin_left: f32,
+        margin_right: f32,
+    ) {
+        if self.chars.is_empty() {
+            return;
+        }
+
+        let mut line_start = range.start.min(self.chars.len());
+        while line_start > 0 && self.chars[line_start - 1].value != '\n' {
+            line_start -= 1;
+        }
+
+        let range_end = range.end.min(self.chars.len());
+        loop {
+            let line_end = self.current_line_end_index(line_start);
+            let mut paragraph_style = self
+                .chars
+                .get(line_start)
+                .or_else(|| self.chars.get(line_start.saturating_sub(1)))
+                .map(|entry| entry.paragraph_style.clone())
+                .unwrap_or_else(|| self.cursor_adjacent_paragraph_style());
+            paragraph_style.margin_left = margin_left;
+            paragraph_style.margin_right = margin_right;
+            self.apply_paragraph_style_to_line(line_start, line_end, paragraph_style);
+
+            if line_end >= range_end || line_end >= self.chars.len() {
+                break;
+            }
+            line_start = line_end + 1;
+        }
+
+        self.bump_edit_revision();
+    }
+
     fn clear_paragraph_style_from_line(&mut self, line_start: usize, line_end: usize) {
         for entry in &mut self.chars[line_start..line_end] {
             clear_paragraph_list_style(&mut entry.paragraph_style);
@@ -1569,13 +1628,7 @@ impl Widget for RichTextBox<'_> {
                     && editor_canvas_has_focus
                     && consume_keyboard_input(ui, self.state, &keyboard_layout);
 
-                draw_editor_ruler_bar(
-                    ui,
-                    viewport_width,
-                    canvas_width,
-                    page_width,
-                    self.state.page_margins,
-                );
+                draw_editor_ruler_bar(ui, self.state, viewport_width, canvas_width, page_width);
                 ui.add_space(RULER_BAR_BOTTOM_GAP);
 
                 let scroll_output = egui::ScrollArea::both()
@@ -1891,10 +1944,10 @@ pub fn draw_editor_toolbar(ui: &mut Ui, state: &mut RichTextBoxState) {
 
 fn draw_editor_ruler_bar(
     ui: &mut Ui,
+    state: &mut RichTextBoxState,
     viewport_width: f32,
     canvas_width: f32,
     page_width: f32,
-    page_margins: PageMargins,
 ) {
     egui::Frame::none()
         .fill(Color32::from_rgb(35, 35, 35))
@@ -1908,7 +1961,7 @@ fn draw_editor_ruler_bar(
                 viewport_width,
                 canvas_width,
                 page_width,
-                page_margins,
+                state,
                 scroll_offset_x,
             );
         });
@@ -2129,7 +2182,7 @@ fn draw_ruler_bar(
     viewport_width: f32,
     canvas_width: f32,
     page_width: f32,
-    page_margins: PageMargins,
+    state: &mut RichTextBoxState,
     scroll_offset_x: f32,
 ) {
     let (ruler_rect, _response) =
@@ -2142,13 +2195,30 @@ fn draw_ruler_bar(
     );
     let content_rect = Rect::from_min_max(
         Pos2::new(
-            page_rect.left() + page_text_margin_left(page_width, page_margins),
+            page_rect.left() + page_text_margin_left(page_width, state.page_margins),
             page_rect.top(),
         ),
         Pos2::new(
-            page_rect.right() - page_text_margin_right(page_width, page_margins),
+            page_rect.right() - page_text_margin_right(page_width, state.page_margins),
             page_rect.bottom(),
         ),
+    );
+    let page_scale = (page_width / A4_PAGE_WIDTH).clamp(MIN_PAGE_SCALE, MAX_PAGE_SCALE);
+    let active_paragraph_style = state.active_paragraph_style();
+    let max_paragraph_margin = (content_rect.width() / page_scale - 80.0).max(0.0);
+    let paragraph_left_margin = active_paragraph_style
+        .margin_left
+        .clamp(0.0, max_paragraph_margin);
+    let paragraph_right_margin = active_paragraph_style
+        .margin_right
+        .clamp(0.0, max_paragraph_margin);
+    let paragraph_left_x =
+        (content_rect.left() + paragraph_left_margin * page_scale).min(content_rect.right() - 16.0);
+    let paragraph_right_x =
+        (content_rect.right() - paragraph_right_margin * page_scale).max(paragraph_left_x + 16.0);
+    let paragraph_rect = Rect::from_min_max(
+        Pos2::new(paragraph_left_x, content_rect.top()),
+        Pos2::new(paragraph_right_x, content_rect.bottom()),
     );
 
     ui.painter()
@@ -2157,6 +2227,7 @@ fn draw_ruler_bar(
     let ruler_painter = ui.painter().with_clip_rect(ruler_rect);
     ruler_painter.rect_filled(page_rect, 4.0, Color32::from_rgb(210, 210, 210));
     ruler_painter.rect_filled(content_rect, 0.0, Color32::from_rgb(242, 242, 242));
+    ruler_painter.rect_filled(paragraph_rect, 0.0, Color32::from_rgb(225, 238, 250));
     ruler_painter.rect_stroke(
         page_rect,
         4.0,
@@ -2189,6 +2260,110 @@ fn draw_ruler_bar(
             Stroke::new(2.0, Color32::from_rgb(20, 96, 160)),
         );
     }
+
+    for marker_x in [paragraph_rect.left(), paragraph_rect.right()] {
+        ruler_painter.line_segment(
+            [
+                Pos2::new(marker_x, page_rect.top() + 2.0),
+                Pos2::new(marker_x, page_rect.bottom() - 2.0),
+            ],
+            Stroke::new(2.0, Color32::from_rgb(32, 128, 208)),
+        );
+    }
+
+    let left_handle_rect = Rect::from_center_size(
+        Pos2::new(paragraph_rect.left(), page_rect.center().y),
+        egui::vec2(14.0, RULER_BAR_HEIGHT),
+    );
+    let right_handle_rect = Rect::from_center_size(
+        Pos2::new(paragraph_rect.right(), page_rect.center().y),
+        egui::vec2(14.0, RULER_BAR_HEIGHT),
+    );
+
+    let left_response = ui
+        .interact(
+            left_handle_rect,
+            ui.id().with("paragraph_margin_left_handle"),
+            Sense::drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    let right_response = ui
+        .interact(
+            right_handle_rect,
+            ui.id().with("paragraph_margin_right_handle"),
+            Sense::drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+
+    paint_ruler_margin_handle(
+        &ruler_painter,
+        paragraph_rect.left(),
+        page_rect,
+        true,
+        left_response.hovered() || left_response.dragged(),
+    );
+    paint_ruler_margin_handle(
+        &ruler_painter,
+        paragraph_rect.right(),
+        page_rect,
+        false,
+        right_response.hovered() || right_response.dragged(),
+    );
+
+    if left_response.dragged() {
+        if let Some(pointer_pos) = left_response.interact_pointer_pos() {
+            let max_left_margin =
+                ((paragraph_right_x - content_rect.left()) / page_scale - 80.0).max(0.0);
+            let margin_left =
+                ((pointer_pos.x - content_rect.left()) / page_scale).clamp(0.0, max_left_margin);
+            state.set_active_paragraph_horizontal_margins(margin_left, paragraph_right_margin);
+            focus_editor_canvas(ui);
+        }
+    }
+
+    if right_response.dragged() {
+        if let Some(pointer_pos) = right_response.interact_pointer_pos() {
+            let max_right_margin =
+                ((content_rect.right() - paragraph_left_x) / page_scale - 80.0).max(0.0);
+            let margin_right =
+                ((content_rect.right() - pointer_pos.x) / page_scale).clamp(0.0, max_right_margin);
+            state.set_active_paragraph_horizontal_margins(paragraph_left_margin, margin_right);
+            focus_editor_canvas(ui);
+        }
+    }
+}
+
+fn paint_ruler_margin_handle(
+    painter: &egui::Painter,
+    x: f32,
+    page_rect: Rect,
+    points_right: bool,
+    active: bool,
+) {
+    let center_y = page_rect.center().y;
+    let color = if active {
+        Color32::from_rgb(45, 145, 235)
+    } else {
+        Color32::from_rgb(20, 96, 160)
+    };
+    let points = if points_right {
+        vec![
+            Pos2::new(x - 5.0, center_y - 6.0),
+            Pos2::new(x + 5.0, center_y),
+            Pos2::new(x - 5.0, center_y + 6.0),
+        ]
+    } else {
+        vec![
+            Pos2::new(x + 5.0, center_y - 6.0),
+            Pos2::new(x - 5.0, center_y),
+            Pos2::new(x + 5.0, center_y + 6.0),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        color,
+        Stroke::new(1.0, Color32::from_rgb(12, 58, 98)),
+    ));
 }
 
 fn scaled_page_width(page_scale: f32) -> f32 {
@@ -3829,6 +4004,67 @@ mod tests {
         assert_eq!(spec.width, 470.0);
         assert_eq!(spec.alignment, ParagraphAlignment::End);
         assert_eq!(spec.line_height_percent, Some(130.0));
+    }
+
+    #[test]
+    fn active_paragraph_horizontal_margins_update_current_paragraph_only() {
+        let first_style = ParagraphStyle {
+            margin_left: 4.0,
+            margin_right: 6.0,
+            ..ParagraphStyle::default()
+        };
+        let second_style = ParagraphStyle {
+            margin_left: 11.0,
+            margin_right: 13.0,
+            ..ParagraphStyle::default()
+        };
+        let mut state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('A', InlineStyle::default(), first_style.clone()),
+            StyledChar::new('\n', InlineStyle::default(), first_style),
+            StyledChar::new('B', InlineStyle::default(), second_style.clone()),
+            StyledChar::new('e', InlineStyle::default(), second_style.clone()),
+            StyledChar::new('t', InlineStyle::default(), second_style.clone()),
+            StyledChar::new('a', InlineStyle::default(), second_style),
+        ]);
+        state.cursor_index = 3;
+
+        state.set_active_paragraph_horizontal_margins(24.0, 36.0);
+
+        assert_eq!(state.chars[0].paragraph_style.margin_left, 4.0);
+        assert_eq!(state.chars[0].paragraph_style.margin_right, 6.0);
+        assert_eq!(state.chars[2].paragraph_style.margin_left, 24.0);
+        assert_eq!(state.chars[5].paragraph_style.margin_right, 36.0);
+    }
+
+    #[test]
+    fn active_paragraph_horizontal_margins_update_selected_paragraphs() {
+        let first_style = ParagraphStyle::default();
+        let second_style = ParagraphStyle {
+            margin_left: 11.0,
+            margin_right: 13.0,
+            ..ParagraphStyle::default()
+        };
+        let mut state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('A', InlineStyle::default(), first_style.clone()),
+            StyledChar::new('\n', InlineStyle::default(), first_style),
+            StyledChar::new('B', InlineStyle::default(), second_style.clone()),
+            StyledChar::new('e', InlineStyle::default(), second_style.clone()),
+            StyledChar::new('t', InlineStyle::default(), second_style.clone()),
+            StyledChar::new('a', InlineStyle::default(), second_style),
+        ]);
+        state.selection_anchor = Some(0);
+        state.selection_focus = Some(4);
+
+        state.set_active_paragraph_horizontal_margins(8.0, 10.0);
+
+        assert!(state
+            .chars
+            .iter()
+            .all(|entry| entry.paragraph_style.margin_left == 8.0));
+        assert!(state
+            .chars
+            .iter()
+            .all(|entry| entry.paragraph_style.margin_right == 10.0));
     }
 
     #[test]
