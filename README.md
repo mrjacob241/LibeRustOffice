@@ -10,7 +10,7 @@
 - [x] Open and read '.odt' documents
 - [x] Create and save new '.odt' files
 - [x] Rich text formatting (bold, italic, underline, strikethrough)
-- [ ] Paragraph alignment (left, center, right, justified)
+- [x] Paragraph alignment (left, center, right, justified)
 - [ ] Font customization (size, family, color)
 - [x] Bullet and numbered lists
 - [ ] Headings and document structure support
