@@ -203,6 +203,15 @@ pub fn save_document_to_odt(
     chars: &[StyledChar],
     images: &[DocumentImage],
 ) -> Result<(), OdtSaveError> {
+    save_document_to_odt_with_page_margins(path, chars, images, PageMargins::default())
+}
+
+pub fn save_document_to_odt_with_page_margins(
+    path: impl AsRef<Path>,
+    chars: &[StyledChar],
+    images: &[DocumentImage],
+    page_margins: PageMargins,
+) -> Result<(), OdtSaveError> {
     let path = resolve_export_target_path(path.as_ref())?;
     let temp_dir = create_export_temp_dir(&path)?;
     let mimetype_path = temp_dir.join("mimetype");
@@ -213,7 +222,10 @@ pub fn save_document_to_odt(
     let manifest_xml_path = temp_dir.join(MANIFEST_XML_ENTRY);
 
     write_export_file(&mimetype_path, ODT_MIMETYPE)?;
-    write_export_file(&styles_xml_path, export_styles_xml(chars))?;
+    write_export_file(
+        &styles_xml_path,
+        export_styles_xml_with_page_margins(chars, page_margins),
+    )?;
     write_export_images(&pictures_dir, images)?;
     write_export_file(&content_xml_path, export_content_xml(chars, images))?;
     fs::create_dir_all(&manifest_dir).map_err(|source| OdtSaveError::Io {
@@ -611,6 +623,7 @@ fn extract_document_content(
     let mut cursor = 0;
     let mut in_text_block = false;
     let mut current_block_has_content = false;
+    let mut current_block_start_index = 0;
     let mut current_block_style = styles.default_style;
     let mut current_paragraph_style = styles.default_paragraph_style.clone();
     let mut last_closed_block_had_content = false;
@@ -689,6 +702,7 @@ fn extract_document_content(
             }
             style_stack.clear();
             style_stack.push(current_block_style);
+            current_block_start_index = chars.len();
             current_block_has_content = false;
 
             if let Some(list_marker) = current_paragraph_style.list_marker {
@@ -734,21 +748,35 @@ fn extract_document_content(
                 in_text_block = true;
             }
         } else if tag == PARAGRAPH_CLOSE_TAG || tag == HEADING_CLOSE_TAG {
+            normalize_imported_list_prefix_style(
+                &mut chars,
+                current_block_start_index,
+                &current_paragraph_style,
+            );
+            let paragraph_close_style = if current_block_has_content {
+                chars
+                    .last()
+                    .map(|entry| entry.style)
+                    .unwrap_or(current_block_style)
+            } else {
+                current_block_style
+            };
             chars.push(StyledChar::new(
                 '\n',
-                current_block_style,
+                paragraph_close_style,
                 current_paragraph_style.clone(),
             ));
             if current_block_has_content && current_paragraph_style.list_marker.is_none() {
                 chars.push(StyledChar::new(
                     '\n',
-                    current_block_style,
+                    paragraph_close_style,
                     current_paragraph_style.clone(),
                 ));
             }
             last_closed_block_had_content = current_block_has_content;
             in_text_block = false;
             current_block_has_content = false;
+            current_block_start_index = chars.len();
             style_stack.clear();
             style_stack.push(styles.default_style);
             current_paragraph_style = styles.default_paragraph_style.clone();
@@ -827,6 +855,27 @@ fn extract_document_content(
         images,
         page_margins: PageMargins::default(),
     })
+}
+
+fn normalize_imported_list_prefix_style(
+    chars: &mut [StyledChar],
+    line_start: usize,
+    paragraph_style: &ParagraphStyle,
+) {
+    if paragraph_style.list_marker.is_none() || line_start >= chars.len() {
+        return;
+    }
+
+    let Some(prefix_len) = export_list_prefix_len(&chars[line_start..], paragraph_style) else {
+        return;
+    };
+    let Some(content_style) = chars.get(line_start + prefix_len).map(|entry| entry.style) else {
+        return;
+    };
+
+    for entry in &mut chars[line_start..line_start + prefix_len] {
+        entry.style = content_style;
+    }
 }
 
 fn normalize_tab_prefixed_list_metadata_for_export(chars: &mut [StyledChar]) {
@@ -1380,6 +1429,10 @@ fn export_manifest_xml(images: &[DocumentImage]) -> String {
 }
 
 fn export_styles_xml(chars: &[StyledChar]) -> String {
+    export_styles_xml_with_page_margins(chars, PageMargins::default())
+}
+
+fn export_styles_xml_with_page_margins(chars: &[StyledChar], page_margins: PageMargins) -> String {
     let mut export_chars = chars.to_vec();
     normalize_tab_prefixed_list_metadata_for_export(&mut export_chars);
 
@@ -1400,6 +1453,13 @@ fn export_styles_xml(chars: &[StyledChar]) -> String {
     </style:default-style>
 "##,
     );
+    xml.push_str(&format!(
+        "    <style:page-layout style:name=\"LroPageLayout\"><style:page-layout-properties fo:page-width=\"21.0000cm\" fo:page-height=\"29.7000cm\" fo:margin-left=\"{}\" fo:margin-right=\"{}\" fo:margin-top=\"{}\" fo:margin-bottom=\"{}\"/></style:page-layout>\n    <style:master-page style:name=\"Standard\" style:page-layout-name=\"LroPageLayout\"/>\n",
+        export_page_margin_cm(page_margins.left_cm),
+        export_page_margin_cm(page_margins.right_cm),
+        export_page_margin_cm(page_margins.top_cm),
+        export_page_margin_cm(page_margins.bottom_cm),
+    ));
 
     for paragraph_style in collect_export_paragraph_styles(&export_chars) {
         xml.push_str(&format!(
@@ -1475,15 +1535,14 @@ fn collect_export_paragraph_styles(chars: &[StyledChar]) -> Vec<ParagraphStyle> 
             .get(line_end + 1)
             .map(|entry| entry.paragraph_style.clone());
         if let Some(line_style) = line_style {
-            if line_style.list_marker.is_some() {
+            if line_style.list_marker.is_some() && uses_generated_list_spacing(&line_style) {
                 let list_item_style = paragraph_style_for_generated_list_item(line_style);
                 if !styles.iter().any(|style| *style == list_item_style) {
                     styles.push(list_item_style);
                 }
-            } else if next_line_style
-                .as_ref()
-                .is_some_and(|style| style.list_marker.is_some())
-            {
+            } else if next_line_style.as_ref().is_some_and(|style| {
+                style.list_marker.is_some() && uses_generated_list_spacing(style)
+            }) {
                 let before_list_style = paragraph_style_before_generated_list(line_style);
                 if !styles.iter().any(|style| *style == before_list_style) {
                     styles.push(before_list_style);
@@ -1678,9 +1737,9 @@ fn export_paragraphs(
             let entering_list_block = paragraph_has_content
                 && newline_count == 1
                 && current_paragraph_style.list_marker.is_none()
-                && next_paragraph_style
-                    .as_ref()
-                    .is_some_and(|style| style.list_marker.is_some());
+                && next_paragraph_style.as_ref().is_some_and(|style| {
+                    style.list_marker.is_some() && uses_generated_list_spacing(style)
+                });
             if paragraph_has_content
                 && newline_count == 1
                 && current_paragraph_style.list_marker.is_none()
@@ -1688,13 +1747,20 @@ fn export_paragraphs(
                     .as_ref()
                     .is_none_or(|style| style.list_marker.is_none())
             {
-                paragraph_xml.push_str("<text:line-break/>");
+                push_styled_inline_xml(
+                    &mut paragraph_xml,
+                    entry.style,
+                    "<text:line-break/>",
+                    styles,
+                );
                 paragraph_chars.push(entry.clone());
             } else {
                 let current_is_list_block = current_paragraph_style.list_marker.is_some();
+                let current_uses_generated_list_spacing =
+                    current_is_list_block && uses_generated_list_spacing(&current_paragraph_style);
                 let paragraph_style = if entering_list_block {
                     paragraph_style_before_generated_list(current_paragraph_style.clone())
-                } else if current_is_list_block {
+                } else if current_uses_generated_list_spacing {
                     paragraph_style_for_generated_list_item(current_paragraph_style.clone())
                 } else {
                     current_paragraph_style.clone()
@@ -1759,7 +1825,7 @@ fn export_paragraphs(
 
         if entry.value == '\t' {
             flush_export_run(&mut paragraph_xml, &mut run_text, &mut run_style, styles);
-            paragraph_xml.push_str("<text:tab/>");
+            push_styled_inline_xml(&mut paragraph_xml, entry.style, "<text:tab/>", styles);
             paragraph_chars.push(entry.clone());
             paragraph_has_content = true;
             index += 1;
@@ -1812,6 +1878,13 @@ fn paragraph_style_for_generated_list_item(mut style: ParagraphStyle) -> Paragra
     style.margin_top = 0.0;
     style.margin_bottom = 0.0;
     style
+}
+
+fn uses_generated_list_spacing(style: &ParagraphStyle) -> bool {
+    matches!(
+        style.list_style_name.as_deref(),
+        Some(GENERATED_BULLET_LIST_STYLE_NAME | GENERATED_NUMBERED_LIST_STYLE_NAME)
+    )
 }
 
 fn export_list_prefix_len(chars: &[StyledChar], paragraph_style: &ParagraphStyle) -> Option<usize> {
@@ -1910,6 +1983,10 @@ fn export_length_inches(length_px: f32) -> String {
     format!("{:.4}in", length_px.max(0.0) / IN_TO_PX)
 }
 
+fn export_page_margin_cm(margin_cm: f32) -> String {
+    format!("{:.4}cm", margin_cm.max(0.0) / DOCUMENT_PAGE_MARGIN_SCALE)
+}
+
 fn flush_export_run(
     paragraph_xml: &mut String,
     run_text: &mut String,
@@ -1934,6 +2011,21 @@ fn flush_export_run(
     *run_style = None;
 }
 
+fn push_styled_inline_xml(
+    paragraph_xml: &mut String,
+    style: InlineStyle,
+    inline_xml: &str,
+    styles: &ExportStyleRegistry,
+) {
+    if let Some(style_name) = styles.style_name(style) {
+        paragraph_xml.push_str(&format!(
+            "<text:span text:style-name=\"{style_name}\">{inline_xml}</text:span>"
+        ));
+    } else {
+        paragraph_xml.push_str(inline_xml);
+    }
+}
+
 fn encode_xml_text(raw_text: &str) -> String {
     raw_text
         .replace('&', "&amp;")
@@ -1951,11 +2043,7 @@ struct ExportStyleRegistry {
 impl ExportStyleRegistry {
     fn collect_styles(&mut self, chars: &[StyledChar]) {
         for entry in chars {
-            if entry.value == '\n'
-                || entry.value == '\t'
-                || entry.value == EMBEDDED_IMAGE_OBJECT_CHAR
-                || entry.value == SOFT_PAGE_BREAK_CHAR
-            {
+            if entry.value == EMBEDDED_IMAGE_OBJECT_CHAR || entry.value == SOFT_PAGE_BREAK_CHAR {
                 continue;
             }
 

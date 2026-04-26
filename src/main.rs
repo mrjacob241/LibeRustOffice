@@ -2,7 +2,7 @@ mod odt_pipeline;
 mod rich_textbox;
 
 use eframe::egui;
-use odt_pipeline::{load_document_from_odt, save_document_to_odt, OdtLoadError};
+use odt_pipeline::{load_document_from_odt, save_document_to_odt_with_page_margins, OdtLoadError};
 use rich_textbox::{draw_editor_toolbar, RichTextBox, RichTextBoxState};
 use std::path::{Path, PathBuf};
 
@@ -85,6 +85,9 @@ impl Default for LibeRustOfficeApp {
 impl eframe::App for LibeRustOfficeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
+        if consume_save_shortcut(ctx) {
+            self.save_document();
+        }
 
         egui::TopBottomPanel::top("app_menu_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -533,7 +536,12 @@ impl LibeRustOfficeApp {
 
     fn save_document(&mut self) {
         if let Some(path) = self.document_path.clone() {
-            match save_document_to_odt(&path, &self.editor.chars, &self.editor.images) {
+            match save_document_to_odt_with_page_margins(
+                &path,
+                &self.editor.chars,
+                &self.editor.images,
+                self.editor.page_margins,
+            ) {
                 Ok(()) => {
                     self.document_name = document_name_from_path(&path);
                     self.document_path = Some(path);
@@ -554,7 +562,12 @@ impl LibeRustOfficeApp {
             .set_file_name(self.document_name.clone())
             .save_file()
         {
-            match save_document_to_odt(&path, &self.editor.chars, &self.editor.images) {
+            match save_document_to_odt_with_page_margins(
+                &path,
+                &self.editor.chars,
+                &self.editor.images,
+                self.editor.page_margins,
+            ) {
                 Ok(()) => {
                     self.document_name = document_name_from_path(&path);
                     self.document_path = Some(path);
@@ -644,6 +657,15 @@ fn document_name_from_path(path: impl AsRef<Path>) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or(NEW_FILE_NAME)
         .to_owned()
+}
+
+fn consume_save_shortcut(ctx: &egui::Context) -> bool {
+    ctx.input_mut(|input| {
+        input.consume_shortcut(&egui::KeyboardShortcut::new(
+            egui::Modifiers::COMMAND,
+            egui::Key::S,
+        ))
+    })
 }
 
 fn main() -> eframe::Result<()> {

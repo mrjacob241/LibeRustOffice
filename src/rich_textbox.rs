@@ -2493,6 +2493,12 @@ fn consume_keyboard_input(ui: &Ui, state: &mut RichTextBoxState, layout: &LaidOu
                     state.insert_text(&text);
                     changed = true;
                 }
+                egui::Event::CompositionEnd(text) => {
+                    if text != "\n" && text != "\r" {
+                        state.insert_text(&text);
+                        changed = true;
+                    }
+                }
                 egui::Event::Paste(text) => {
                     state.insert_text(&text);
                     changed = true;
