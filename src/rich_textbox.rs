@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 const CHAR_SKIP: f32 = 1.5;
 const PT_TO_PX: f32 = 4.0 / 3.0;
+const FONT_RENDER_SCALE: f32 = 0.85;
 const CURSOR_SCROLL_MARGIN_X: f32 = 24.0;
 const CURSOR_SCROLL_MARGIN_Y: f32 = 32.0;
 const CANVAS_BOTTOM_VIEWPORT_PADDING: f32 = 0.0;
@@ -18,8 +19,9 @@ const A4_PAGE_WIDTH: f32 = 794.0;
 const A4_PAGE_HEIGHT: f32 = 1123.0;
 const A4_PAGE_WIDTH_CM: f32 = 21.0;
 const A4_PAGE_HEIGHT_CM: f32 = 29.7;
-const PAGE_HORIZONTAL_MARGIN_CM: f32 = 2.0;
-const PAGE_VERTICAL_MARGIN_CM: f32 = 2.0;
+const PAGE_HORIZONTAL_MARGIN_CM: f32 = 1.25;
+const PAGE_TOP_MARGIN_CM: f32 = 1.5;
+const PAGE_BOTTOM_MARGIN_CM: f32 = 2.0;
 const PAGE_GAP: f32 = 28.0;
 const PAGE_SIDE_MARGIN: f32 = 24.0;
 const MIN_PAGE_SCALE: f32 = 0.5;
@@ -46,6 +48,13 @@ pub const TEXT_COLOR_PALETTE: [Color32; 5] = [
     Color32::GREEN,
     Color32::from_rgb(255, 165, 0),
 ];
+pub const HIGHLIGHT_COLOR_PALETTE: [Option<Color32>; 5] = [
+    None,
+    Some(Color32::YELLOW),
+    Some(Color32::from_rgb(255, 210, 120)),
+    Some(Color32::from_rgb(180, 230, 180)),
+    Some(Color32::from_rgb(190, 220, 255)),
+];
 pub const EDITOR_CANVAS_ID_SOURCE: &str = "libe_rust_office_editor_canvas";
 const GENERATED_BULLET_LIST_STYLE_NAME: &str = "LroBulletList";
 const GENERATED_BULLET_MARKER: char = '•';
@@ -60,6 +69,7 @@ pub struct InlineStyle {
     pub italic: bool,
     pub underline: bool,
     pub color: Color32,
+    pub background_color: Option<Color32>,
 }
 
 impl Default for InlineStyle {
@@ -70,6 +80,7 @@ impl Default for InlineStyle {
             italic: false,
             underline: false,
             color: Color32::BLACK,
+            background_color: None,
         }
     }
 }
@@ -150,6 +161,23 @@ impl StyledChar {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayoutOptions {
+    pub honor_paragraph_alignment: bool,
+    pub honor_paragraph_spacing: bool,
+    pub show_cursor_debug: bool,
+}
+
+impl Default for LayoutOptions {
+    fn default() -> Self {
+        Self {
+            honor_paragraph_alignment: true,
+            honor_paragraph_spacing: true,
+            show_cursor_debug: false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DocumentImage {
     pub path: PathBuf,
@@ -174,6 +202,7 @@ pub struct RichTextBoxState {
     pub selection_anchor: Option<usize>,
     pub selection_focus: Option<usize>,
     pub edit_revision: u64,
+    pub layout_options: LayoutOptions,
     open_image_tab_requested: bool,
 }
 
@@ -209,6 +238,7 @@ impl RichTextBoxState {
             selection_anchor: None,
             selection_focus: None,
             edit_revision: 0,
+            layout_options: LayoutOptions::default(),
             open_image_tab_requested: false,
         }
     }
@@ -504,6 +534,11 @@ impl RichTextBoxState {
         self.apply_to_selection(|style| style.color = color);
     }
 
+    pub fn set_highlight_color(&mut self, color: Option<Color32>) {
+        self.typing_style.background_color = color;
+        self.apply_to_selection(|style| style.background_color = color);
+    }
+
     pub fn zoom_in_page(&mut self) {
         self.page_scale = ((self.page_scale + PAGE_SCALE_STEP) * 100.0).round() / 100.0;
         self.page_scale = self.page_scale.min(MAX_PAGE_SCALE);
@@ -546,6 +581,12 @@ impl RichTextBoxState {
         self.selected_range()
             .map(|range| self.chars[range.start].style.color)
             .unwrap_or_else(|| self.cursor_adjacent_style().color)
+    }
+
+    pub fn active_highlight_color(&self) -> Option<Color32> {
+        self.selected_range()
+            .map(|range| self.chars[range.start].style.background_color)
+            .unwrap_or_else(|| self.cursor_adjacent_style().background_color)
     }
 
     pub fn active_bullet_list(&self) -> bool {
@@ -660,8 +701,7 @@ impl RichTextBoxState {
     fn delete_empty_list_line_if_any(&mut self) -> bool {
         let line_start = self.current_line_start_index();
         let line_end = self.current_line_end_index(line_start);
-        let Some(list_style) = self.current_line_list_style(line_start, line_end)
-        else {
+        let Some(list_style) = self.current_line_list_style(line_start, line_end) else {
             return false;
         };
 
@@ -711,9 +751,11 @@ impl RichTextBoxState {
             return false;
         }
 
-        let Some(current_style) = self.chars.get(line_start).map(|entry| {
-            entry.paragraph_style.clone()
-        }) else {
+        let Some(current_style) = self
+            .chars
+            .get(line_start)
+            .map(|entry| entry.paragraph_style.clone())
+        else {
             return false;
         };
         let Some(list_marker) = current_style.list_marker else {
@@ -964,7 +1006,11 @@ impl RichTextBoxState {
         for entry in &mut self.chars[line_start..line_end] {
             entry.paragraph_style = paragraph_style.clone();
         }
-        if let Some(entry) = self.chars.get_mut(line_end).filter(|entry| entry.value == '\n') {
+        if let Some(entry) = self
+            .chars
+            .get_mut(line_end)
+            .filter(|entry| entry.value == '\n')
+        {
             entry.paragraph_style = paragraph_style;
         }
     }
@@ -973,7 +1019,11 @@ impl RichTextBoxState {
         for entry in &mut self.chars[line_start..line_end] {
             clear_paragraph_list_style(&mut entry.paragraph_style);
         }
-        if let Some(entry) = self.chars.get_mut(line_end).filter(|entry| entry.value == '\n') {
+        if let Some(entry) = self
+            .chars
+            .get_mut(line_end)
+            .filter(|entry| entry.value == '\n')
+        {
             clear_paragraph_list_style(&mut entry.paragraph_style);
         }
     }
@@ -1134,6 +1184,7 @@ impl RenderTransform {
 
     fn apply_to_style(self, mut style: InlineStyle) -> InlineStyle {
         style.font_size *= self.scale.y.max(0.1);
+        style = rendered_inline_style(style);
         style
     }
 }
@@ -1184,6 +1235,25 @@ impl RenderBox {
         matches!(self.kind, RenderBoxKind::Image { .. })
     }
 
+    fn paint_text_background(self, ui: &Ui, entry: &StyledChar) {
+        if !self.is_text_char() {
+            return;
+        }
+
+        let paint_rect = self.visual_rect();
+        let paint_style = self.transform.apply_to_style(entry.style);
+        if let Some(background_color) = paint_style.background_color {
+            ui.painter().rect_filled(
+                paint_rect.expand2(egui::vec2(
+                    rendered_char_skip() * self.transform.scale.x * 0.5,
+                    1.0 * self.transform.scale.y,
+                )),
+                0.0,
+                background_color,
+            );
+        }
+    }
+
     fn paint(self, ui: &Ui, entry: &StyledChar) {
         if self.is_line_break() {
             return;
@@ -1197,7 +1267,8 @@ impl RenderBox {
 
         if paint_style.bold {
             ui.painter().galley(
-                paint_rect.left_top() + egui::vec2(0.8 * self.transform.scale.x, 0.0),
+                paint_rect.left_top()
+                    + egui::vec2(rendered_bold_width_offset() * self.transform.scale.x, 0.0),
                 galley,
                 paint_style.color,
             );
@@ -1241,6 +1312,25 @@ struct PendingGlyph {
     height: f32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ParagraphLayoutSpec {
+    left_x: f32,
+    width: f32,
+    alignment: ParagraphAlignment,
+    line_height_percent: Option<f32>,
+}
+
+impl ParagraphLayoutSpec {
+    fn plain(origin_x: f32, max_width: f32) -> Self {
+        Self {
+            left_x: origin_x,
+            width: max_width,
+            alignment: ParagraphAlignment::Start,
+            line_height_percent: None,
+        }
+    }
+}
+
 pub struct RichTextBox<'a> {
     state: &'a mut RichTextBoxState,
     desired_rows: usize,
@@ -1274,7 +1364,9 @@ impl Widget for RichTextBox<'_> {
                 let page_width = scaled_page_width(self.state.page_scale);
                 let canvas_width = (page_width + PAGE_SIDE_MARGIN * 2.0).max(viewport_width);
 
-                let line_height = self.state.typing_style.font_size * self.state.page_scale * 1.45;
+                let line_height = rendered_font_size(self.state.typing_style.font_size)
+                    * self.state.page_scale
+                    * 1.45;
                 let preferred_viewport_height = self.desired_rows as f32 * line_height;
                 let reserved_footer_height =
                     STATUS_BAR_TOP_GAP + STATUS_BAR_HEIGHT + CANVAS_BOTTOM_VIEWPORT_PADDING;
@@ -1501,6 +1593,7 @@ pub fn draw_editor_toolbar(ui: &mut Ui, state: &mut RichTextBoxState) {
 
                 ui.separator();
                 draw_color_menu(ui, state);
+                draw_highlight_menu(ui, state);
 
                 ui.separator();
                 ui.label(
@@ -1533,12 +1626,19 @@ pub fn draw_editor_toolbar(ui: &mut Ui, state: &mut RichTextBoxState) {
                 }
 
                 ui.separator();
-                if toolbar_toggle(ui, "• ◦ ▪", state.active_bullet_list(), false, false, false) {
+                if toolbar_toggle(ui, "• ◦ ▪", state.active_bullet_list(), false, false, false)
+                {
                     state.toggle_bullet_list();
                     focus_editor_canvas(ui);
                 }
-                if toolbar_toggle(ui, "1. 2. 3.", state.active_numbered_list(), false, false, false)
-                {
+                if toolbar_toggle(
+                    ui,
+                    "1. 2. 3.",
+                    state.active_numbered_list(),
+                    false,
+                    false,
+                    false,
+                ) {
                     state.toggle_numbered_list();
                     focus_editor_canvas(ui);
                 }
@@ -1643,6 +1743,55 @@ fn draw_color_menu(ui: &mut Ui, state: &mut RichTextBoxState) {
 
                     if response.clicked() {
                         state.set_text_color(color);
+                        focus_editor_canvas(ui);
+                        ui.close_menu();
+                    }
+                }
+            });
+        });
+    });
+}
+
+fn draw_highlight_menu(ui: &mut Ui, state: &mut RichTextBoxState) {
+    let active_color = state.active_highlight_color();
+    let swatch_color = active_color.unwrap_or(Color32::from_gray(35));
+
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(12.0, 2.0);
+        ui.visuals_mut().widgets.inactive.weak_bg_fill = swatch_color;
+        ui.visuals_mut().widgets.hovered.weak_bg_fill = swatch_color;
+        ui.visuals_mut().widgets.active.weak_bg_fill = swatch_color;
+        ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.5, Color32::WHITE);
+        ui.visuals_mut().widgets.hovered.bg_stroke = Stroke::new(1.5, Color32::WHITE);
+        ui.visuals_mut().widgets.active.bg_stroke = Stroke::new(1.5, Color32::WHITE);
+
+        ui.menu_button("HL", |ui| {
+            ui.horizontal(|ui| {
+                for color in HIGHLIGHT_COLOR_PALETTE {
+                    let (rect, response) =
+                        ui.allocate_exact_size(egui::vec2(24.0, 22.0), Sense::click());
+                    let swatch_rect = rect.shrink(2.0);
+                    if let Some(color) = color {
+                        ui.painter().rect_filled(swatch_rect, 4.0, color);
+                    } else {
+                        ui.painter()
+                            .rect_filled(swatch_rect, 4.0, Color32::from_gray(245));
+                        ui.painter().line_segment(
+                            [swatch_rect.left_bottom(), swatch_rect.right_top()],
+                            Stroke::new(1.5, Color32::RED),
+                        );
+                    }
+                    ui.painter().rect_stroke(
+                        swatch_rect,
+                        4.0,
+                        Stroke::new(
+                            if color == active_color { 2.0 } else { 1.0 },
+                            Color32::from_gray(90),
+                        ),
+                    );
+
+                    if response.clicked() {
+                        state.set_highlight_color(color);
                         focus_editor_canvas(ui);
                         ui.close_menu();
                     }
@@ -1761,18 +1910,25 @@ fn page_text_width(page_width: f32) -> f32 {
     (page_width - page_text_margin_x(page_width) * 2.0).max(120.0)
 }
 
-fn page_text_margin_y(page_scale: f32) -> f32 {
-    scaled_page_height(page_scale) * (PAGE_VERTICAL_MARGIN_CM / A4_PAGE_HEIGHT_CM)
+fn page_text_margin_top(page_scale: f32) -> f32 {
+    scaled_page_height(page_scale) * (PAGE_TOP_MARGIN_CM / A4_PAGE_HEIGHT_CM)
+}
+
+fn page_text_margin_bottom(page_scale: f32) -> f32 {
+    scaled_page_height(page_scale) * (PAGE_BOTTOM_MARGIN_CM / A4_PAGE_HEIGHT_CM)
 }
 
 fn page_text_height(page_scale: f32) -> f32 {
-    (scaled_page_height(page_scale) - page_text_margin_y(page_scale) * 2.0).max(120.0)
+    (scaled_page_height(page_scale)
+        - page_text_margin_top(page_scale)
+        - page_text_margin_bottom(page_scale))
+    .max(120.0)
 }
 
 fn logical_page_content_origin(page_top_left: Pos2, page_scale: f32) -> Pos2 {
     Pos2::new(
         page_top_left.x / page_scale + page_text_margin_x(A4_PAGE_WIDTH),
-        page_top_left.y / page_scale + page_text_margin_y(1.0),
+        page_top_left.y / page_scale + page_text_margin_top(1.0),
     )
 }
 
@@ -1910,16 +2066,44 @@ fn layout_document(
     let mut pending_cursor_slots: Vec<(usize, f32)> = vec![(0, origin.x)];
     let mut pen_x = origin.x;
     let mut pen_y = origin.y;
-    let fallback_line_height = state.typing_style.font_size + LINE_BOTTOM_PADDING;
-    let fallback_caret_height = state.typing_style.font_size;
+    let mut line_spec = ParagraphLayoutSpec::plain(origin.x, max_width);
+    let fallback_line_height =
+        rendered_font_size(state.typing_style.font_size) + LINE_BOTTOM_PADDING;
+    let fallback_caret_height = rendered_font_size(state.typing_style.font_size);
     let mut line_height = 0.0_f32;
     let mut line_caret_height = 0.0_f32;
     let mut image_object_index = 0;
+    let mut at_paragraph_start = true;
 
     for (index, entry) in state.chars.iter().enumerate() {
+        if is_synthetic_paragraph_separator(state, index) {
+            cursor_points[index] = Pos2::new(pen_x * page_scale, pen_y * page_scale);
+            cursor_points[index + 1] = cursor_points[index];
+            continue;
+        }
+
+        if at_paragraph_start {
+            let next_spec =
+                paragraph_layout_spec(entry, origin.x, max_width, &state.layout_options);
+            if state.layout_options.honor_paragraph_spacing {
+                pen_y += entry.paragraph_style.margin_top.max(0.0);
+            }
+            line_spec = next_spec;
+            pen_x = line_spec.left_x;
+            if pending_cursor_slots.is_empty() {
+                pending_cursor_slots.push((index, pen_x));
+            } else if let Some(slot) = pending_cursor_slots.last_mut() {
+                if slot.0 == index {
+                    slot.1 = pen_x;
+                }
+            }
+            at_paragraph_start = false;
+        }
+
         if entry.value == EMBEDDED_IMAGE_OBJECT_CHAR {
             if !pending_glyphs.is_empty() {
                 flush_pending_line(
+                    state,
                     &mut render_boxes,
                     &mut cursor_points,
                     &pending_glyphs,
@@ -1929,12 +2113,19 @@ fn layout_document(
                     line_caret_height,
                     fallback_line_height,
                     fallback_caret_height,
+                    line_spec,
                     page_scale,
+                    false,
                 );
                 pending_glyphs.clear();
                 pending_cursor_slots.clear();
 
-                pen_y = advance_to_next_line_y(pen_y, line_height, fallback_line_height, origin.y);
+                pen_y = advance_to_next_line_y(
+                    pen_y,
+                    resolved_line_height_for_spec(line_height, fallback_line_height, line_spec),
+                    fallback_line_height,
+                    origin.y,
+                );
                 line_height = 0.0;
                 line_caret_height = 0.0;
             }
@@ -1942,12 +2133,13 @@ fn layout_document(
 
             if let Some(image) = state.images.get(image_object_index) {
                 pen_y += image.margin_top;
-                let available_width = (max_width - image.margin_left - image.margin_right).max(1.0);
+                let available_width =
+                    (line_spec.width - image.margin_left - image.margin_right).max(1.0);
                 let image_size = fit_image_size_to_width(image.size, available_width);
                 let image_x = if image.center_horizontally {
-                    origin.x + ((max_width - image_size.x) * 0.5).max(0.0)
+                    line_spec.left_x + ((line_spec.width - image_size.x) * 0.5).max(0.0)
                 } else {
-                    origin.x + image.margin_left
+                    line_spec.left_x + image.margin_left
                 };
 
                 if pen_y + image_size.y > current_page_content_bottom(pen_y, origin.y) {
@@ -1977,7 +2169,7 @@ fn layout_document(
                 image_object_index += 1;
             }
 
-            pen_x = origin.x;
+            pen_x = line_spec.left_x;
             pending_cursor_slots.push((index + 1, pen_x));
             continue;
         }
@@ -1989,10 +2181,14 @@ fn layout_document(
         } else {
             glyph_size.y
         };
-        let glyph_caret_height = entry.style.font_size;
+        let glyph_caret_height = rendered_font_size(entry.style.font_size);
 
-        if entry.value != '\n' && pen_x > origin.x && pen_x + glyph_width > origin.x + max_width {
+        if entry.value != '\n'
+            && pen_x > line_spec.left_x
+            && pen_x + glyph_width > line_spec.left_x + line_spec.width
+        {
             flush_pending_line(
+                state,
                 &mut render_boxes,
                 &mut cursor_points,
                 &pending_glyphs,
@@ -2002,13 +2198,20 @@ fn layout_document(
                 line_caret_height,
                 fallback_line_height,
                 fallback_caret_height,
+                line_spec,
                 page_scale,
+                false,
             );
             pending_glyphs.clear();
             pending_cursor_slots.clear();
 
-            pen_x = origin.x;
-            pen_y = advance_to_next_line_y(pen_y, line_height, fallback_line_height, origin.y);
+            pen_x = line_spec.left_x;
+            pen_y = advance_to_next_line_y(
+                pen_y,
+                resolved_line_height_for_spec(line_height, fallback_line_height, line_spec),
+                fallback_line_height,
+                origin.y,
+            );
             line_height = 0.0;
             line_caret_height = 0.0;
             pending_cursor_slots.push((index, pen_x));
@@ -2024,8 +2227,9 @@ fn layout_document(
                 width: 0.0,
                 height: glyph_height,
             });
-            pending_cursor_slots.push((index + 1, origin.x));
+            pending_cursor_slots.push((index + 1, line_spec.left_x));
             flush_pending_line(
+                state,
                 &mut render_boxes,
                 &mut cursor_points,
                 &pending_glyphs,
@@ -2035,15 +2239,26 @@ fn layout_document(
                 line_caret_height,
                 fallback_line_height,
                 fallback_caret_height,
+                line_spec,
                 page_scale,
+                true,
             );
             pending_glyphs.clear();
             pending_cursor_slots.clear();
 
-            pen_x = origin.x;
-            pen_y = advance_to_next_line_y(pen_y, line_height, fallback_line_height, origin.y);
+            pen_x = line_spec.left_x;
+            pen_y = advance_to_next_line_y(
+                pen_y,
+                resolved_line_height_for_spec(line_height, fallback_line_height, line_spec),
+                fallback_line_height,
+                origin.y,
+            );
+            if state.layout_options.honor_paragraph_spacing {
+                pen_y += entry.paragraph_style.margin_bottom.max(0.0);
+            }
             line_height = 0.0;
             line_caret_height = 0.0;
+            at_paragraph_start = true;
             pending_cursor_slots.push((index + 1, pen_x));
             continue;
         }
@@ -2052,6 +2267,7 @@ fn layout_document(
             if !pending_glyphs.is_empty() {
                 pending_cursor_slots.push((index, pen_x));
                 flush_pending_line(
+                    state,
                     &mut render_boxes,
                     &mut cursor_points,
                     &pending_glyphs,
@@ -2061,7 +2277,9 @@ fn layout_document(
                     line_caret_height,
                     fallback_line_height,
                     fallback_caret_height,
+                    line_spec,
                     page_scale,
+                    false,
                 );
                 pending_glyphs.clear();
                 pending_cursor_slots.clear();
@@ -2072,7 +2290,7 @@ fn layout_document(
                 ((latest_visible_content_bottom(&render_boxes, pen_y) - origin.y) / page_stride)
                     .floor()
                     .max(0.0);
-            pen_x = origin.x;
+            pen_x = line_spec.left_x;
             pen_y = origin.y + (current_page_index + 1.0) * page_stride;
             line_height = 0.0;
             line_caret_height = 0.0;
@@ -2089,11 +2307,12 @@ fn layout_document(
             width: glyph_width,
             height: glyph_height,
         });
-        pen_x += glyph_width + CHAR_SKIP;
+        pen_x += glyph_width + rendered_char_skip();
         pending_cursor_slots.push((index + 1, pen_x));
     }
 
     flush_pending_line(
+        state,
         &mut render_boxes,
         &mut cursor_points,
         &pending_glyphs,
@@ -2103,7 +2322,9 @@ fn layout_document(
         line_caret_height,
         fallback_line_height,
         fallback_caret_height,
+        line_spec,
         page_scale,
+        true,
     );
 
     let logical_content_bottom = document_visual_bottom(
@@ -2168,7 +2389,87 @@ fn latest_visible_content_bottom(render_boxes: &[RenderBox], fallback_y: f32) ->
         .unwrap_or(fallback_y)
 }
 
+fn is_synthetic_paragraph_separator(state: &RichTextBoxState, index: usize) -> bool {
+    if !state.layout_options.honor_paragraph_spacing {
+        return false;
+    }
+
+    let Some(entry) = state.chars.get(index) else {
+        return false;
+    };
+    if entry.value != '\n' {
+        return false;
+    }
+
+    let previous_is_newline = index
+        .checked_sub(1)
+        .and_then(|previous_index| state.chars.get(previous_index))
+        .is_some_and(|previous| previous.value == '\n');
+    let before_previous_is_newline = index
+        .checked_sub(2)
+        .and_then(|previous_index| state.chars.get(previous_index))
+        .is_some_and(|previous| previous.value == '\n');
+
+    previous_is_newline
+        && !before_previous_is_newline
+        && entry.paragraph_style.list_marker.is_none()
+}
+
+fn paragraph_layout_spec(
+    entry: &StyledChar,
+    origin_x: f32,
+    max_width: f32,
+    options: &LayoutOptions,
+) -> ParagraphLayoutSpec {
+    if !options.honor_paragraph_spacing && !options.honor_paragraph_alignment {
+        return ParagraphLayoutSpec::plain(origin_x, max_width);
+    }
+
+    let paragraph_style = &entry.paragraph_style;
+    let margin_left = if options.honor_paragraph_spacing {
+        paragraph_style.margin_left.max(0.0)
+    } else {
+        0.0
+    };
+    let margin_right = if options.honor_paragraph_spacing {
+        paragraph_style.margin_right.max(0.0)
+    } else {
+        0.0
+    };
+    let alignment = if options.honor_paragraph_alignment {
+        paragraph_style.alignment
+    } else {
+        ParagraphAlignment::Start
+    };
+    let line_height_percent = if options.honor_paragraph_spacing {
+        paragraph_style.line_height_percent
+    } else {
+        None
+    };
+
+    ParagraphLayoutSpec {
+        left_x: origin_x + margin_left,
+        width: (max_width - margin_left - margin_right).max(80.0),
+        alignment,
+        line_height_percent,
+    }
+}
+
+fn resolved_line_height_for_spec(
+    line_height: f32,
+    fallback_line_height: f32,
+    line_spec: ParagraphLayoutSpec,
+) -> f32 {
+    let resolved = resolved_line_height(line_height, fallback_line_height);
+    if let Some(percent) = line_spec.line_height_percent {
+        resolved * (percent.max(40.0) / 100.0)
+    } else {
+        resolved
+    }
+}
+
 fn flush_pending_line(
+    state: &RichTextBoxState,
     render_boxes: &mut Vec<RenderBox>,
     cursor_points: &mut [Pos2],
     pending_glyphs: &[PendingGlyph],
@@ -2178,9 +2479,11 @@ fn flush_pending_line(
     caret_height: f32,
     fallback_line_height: f32,
     fallback_caret_height: f32,
+    line_spec: ParagraphLayoutSpec,
     page_scale: f32,
+    paragraph_end: bool,
 ) {
-    let line_height = resolved_line_height(line_height, fallback_line_height);
+    let line_height = resolved_line_height_for_spec(line_height, fallback_line_height, line_spec);
     let caret_height = if caret_height > 0.0 {
         caret_height
     } else {
@@ -2188,18 +2491,35 @@ fn flush_pending_line(
     };
     let baseline_y = line_top_y + (line_height - LINE_BOTTOM_PADDING).max(0.0);
     let caret_y = baseline_y - caret_height;
+    let (alignment_shift, justify_space_extra) =
+        line_alignment_adjustments(state, pending_glyphs, line_spec, paragraph_end);
 
     for (cursor_index, cursor_x) in pending_cursor_slots {
         if let Some(cursor_point) = cursor_points.get_mut(*cursor_index) {
-            *cursor_point = Pos2::new(*cursor_x * page_scale, caret_y * page_scale);
+            let adjusted_x = *cursor_x
+                + alignment_shift
+                + justify_extra_before_x(state, pending_glyphs, *cursor_x, justify_space_extra);
+            *cursor_point = Pos2::new(adjusted_x * page_scale, caret_y * page_scale);
         }
     }
 
     for pending in pending_glyphs {
         let glyph_y = baseline_y - pending.height;
+        let glyph_x = pending.x
+            + alignment_shift
+            + justify_extra_before_x(state, pending_glyphs, pending.x, justify_space_extra);
+        let width = if state
+            .chars
+            .get(pending.index)
+            .is_some_and(|entry| entry.value == ' ')
+        {
+            pending.width + justify_space_extra
+        } else {
+            pending.width
+        };
         let local_rect = Rect::from_min_size(
-            Pos2::new(pending.x, glyph_y),
-            egui::vec2(pending.width, pending.height),
+            Pos2::new(glyph_x, glyph_y),
+            egui::vec2(width, pending.height),
         );
         let kind = if pending.width <= 0.0 {
             RenderBoxKind::LineBreak {
@@ -2218,6 +2538,80 @@ fn flush_pending_line(
             },
         });
     }
+}
+
+fn line_alignment_adjustments(
+    state: &RichTextBoxState,
+    pending_glyphs: &[PendingGlyph],
+    line_spec: ParagraphLayoutSpec,
+    paragraph_end: bool,
+) -> (f32, f32) {
+    let content_width = pending_line_content_width(pending_glyphs);
+    let remaining = (line_spec.width - content_width).max(0.0);
+    let shift = match line_spec.alignment {
+        ParagraphAlignment::Start | ParagraphAlignment::Justify => 0.0,
+        ParagraphAlignment::Center => remaining * 0.5,
+        ParagraphAlignment::End => remaining,
+    };
+
+    let justify_space_extra = if line_spec.alignment == ParagraphAlignment::Justify
+        && !paragraph_end
+        && remaining > 0.0
+    {
+        let spaces = pending_glyphs
+            .iter()
+            .filter(|pending| {
+                state
+                    .chars
+                    .get(pending.index)
+                    .is_some_and(|entry| entry.value == ' ')
+            })
+            .count();
+        if spaces > 0 {
+            remaining / spaces as f32
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    (shift, justify_space_extra)
+}
+
+fn pending_line_content_width(pending_glyphs: &[PendingGlyph]) -> f32 {
+    let Some(first_visible) = pending_glyphs.iter().find(|pending| pending.width > 0.0) else {
+        return 0.0;
+    };
+    let right = pending_glyphs
+        .iter()
+        .filter(|pending| pending.width > 0.0)
+        .map(|pending| pending.x + pending.width)
+        .fold(first_visible.x, f32::max);
+    (right - first_visible.x).max(0.0)
+}
+
+fn justify_extra_before_x(
+    state: &RichTextBoxState,
+    pending_glyphs: &[PendingGlyph],
+    x: f32,
+    space_extra: f32,
+) -> f32 {
+    if space_extra <= 0.0 {
+        return 0.0;
+    }
+
+    let spaces_before = pending_glyphs
+        .iter()
+        .filter(|pending| pending.x + pending.width <= x)
+        .filter(|pending| {
+            state
+                .chars
+                .get(pending.index)
+                .is_some_and(|entry| entry.value == ' ')
+        })
+        .count();
+    spaces_before as f32 * space_extra
 }
 
 fn resolved_line_height(line_height: f32, fallback_line_height: f32) -> f32 {
@@ -2266,15 +2660,36 @@ fn fit_image_size_to_width(image_size: Vec2, max_width: f32) -> Vec2 {
     egui::vec2(max_width, image_size.y * scale)
 }
 
+fn rendered_font_size(font_size: f32) -> f32 {
+    font_size * FONT_RENDER_SCALE
+}
+
+fn rendered_inline_style(mut style: InlineStyle) -> InlineStyle {
+    style.font_size = rendered_font_size(style.font_size);
+    style
+}
+
+fn rendered_char_skip() -> f32 {
+    CHAR_SKIP * FONT_RENDER_SCALE
+}
+
+fn rendered_bold_width_offset() -> f32 {
+    0.8 * FONT_RENDER_SCALE
+}
+
 fn glyph_cell_size(ui: &Ui, value: char, style: InlineStyle) -> Vec2 {
     if value == '\n' {
-        return egui::vec2(0.0, style.font_size + LINE_BOTTOM_PADDING);
+        return egui::vec2(
+            0.0,
+            rendered_font_size(style.font_size) + LINE_BOTTOM_PADDING,
+        );
     }
 
+    let style = rendered_inline_style(style);
     let galley = glyph_galley(ui, value, style);
     let mut size = galley.size();
     if style.bold {
-        size.x += 0.8;
+        size.x += rendered_bold_width_offset();
     }
     size
 }
@@ -2285,7 +2700,7 @@ fn line_break_height(entry: &StyledChar) -> f32 {
     } else {
         0.0
     };
-    entry.style.font_size + LINE_BOTTOM_PADDING + list_gap
+    rendered_font_size(entry.style.font_size) + LINE_BOTTOM_PADDING + list_gap
 }
 
 fn glyph_galley(ui: &Ui, value: char, style: InlineStyle) -> Arc<Galley> {
@@ -2405,6 +2820,13 @@ fn paint_document(
 ) {
     paint_page_backgrounds(ui, layout, canvas_rect);
 
+    for render_box in &layout.render_boxes {
+        if let Some(char_index) = render_box.char_index() {
+            let entry = &state.chars[char_index];
+            render_box.paint_text_background(ui, entry);
+        }
+    }
+
     if let Some(selection_range) = state.selected_range() {
         for render_box in &layout.render_boxes {
             let Some(char_index) = render_box.char_index() else {
@@ -2412,11 +2834,12 @@ fn paint_document(
             };
             if selection_range.contains(&char_index) && render_box.is_text_char() {
                 ui.painter().rect_filled(
-                    render_box
-                        .visual_rect()
-                        .expand2(egui::vec2(CHAR_SKIP * state.page_scale * 0.5, 0.0)),
+                    render_box.visual_rect().expand2(egui::vec2(
+                        rendered_char_skip() * state.page_scale * 0.5,
+                        0.0,
+                    )),
                     1.5,
-                    Color32::from_rgb(180, 215, 255),
+                    selection_highlight_color(),
                 );
             }
         }
@@ -2452,20 +2875,26 @@ fn paint_document(
         .get(state.cursor_index)
         .copied()
         .unwrap_or(canvas_rect.left_top());
-    let cursor_height = state.typing_style.font_size * state.page_scale * 1.35;
+    let cursor_height = rendered_font_size(state.typing_style.font_size) * state.page_scale * 1.35;
     ui.painter().line_segment(
         [cursor_pos, cursor_pos + egui::vec2(0.0, cursor_height)],
         Stroke::new(1.5, Color32::from_rgb(20, 96, 160)),
     );
 
-    let info_pos = canvas_rect.left_bottom() + egui::vec2(0.0, 6.0);
-    ui.painter().text(
-        info_pos,
-        egui::Align2::LEFT_TOP,
-        format!("cursor {}", state.cursor_index),
-        FontId::new(12.0, FontFamily::Proportional),
-        Color32::GRAY,
-    );
+    if state.layout_options.show_cursor_debug {
+        let info_pos = canvas_rect.left_bottom() + egui::vec2(0.0, 6.0);
+        ui.painter().text(
+            info_pos,
+            egui::Align2::LEFT_TOP,
+            format!("cursor {}", state.cursor_index),
+            FontId::new(12.0, FontFamily::Proportional),
+            Color32::GRAY,
+        );
+    }
+}
+
+fn selection_highlight_color() -> Color32 {
+    Color32::from_rgba_unmultiplied(140, 194, 255, 166)
 }
 
 fn paint_image_selection_overlay(ui: &Ui, image_rect: Rect) {
@@ -2555,7 +2984,10 @@ fn scroll_cursor_into_view(ui: &mut Ui, state: &RichTextBoxState, layout: &LaidO
         .unwrap_or(Pos2::ZERO);
     let cursor_rect = Rect::from_min_size(
         cursor_top,
-        egui::vec2(2.0, state.typing_style.font_size * state.page_scale * 1.35),
+        egui::vec2(
+            2.0,
+            rendered_font_size(state.typing_style.font_size) * state.page_scale * 1.35,
+        ),
     )
     .expand2(egui::vec2(CURSOR_SCROLL_MARGIN_X, CURSOR_SCROLL_MARGIN_Y));
 
@@ -2565,8 +2997,9 @@ fn scroll_cursor_into_view(ui: &mut Ui, state: &RichTextBoxState, layout: &LaidO
 #[cfg(test)]
 mod tests {
     use super::{
-        InlineStyle, ParagraphStyle, RichTextBoxState, StyledChar,
-        EMBEDDED_IMAGE_OBJECT_CHAR, PT_TO_PX,
+        is_synthetic_paragraph_separator, line_alignment_adjustments, paragraph_layout_spec,
+        InlineStyle, LayoutOptions, ParagraphAlignment, ParagraphLayoutSpec, ParagraphStyle,
+        PendingGlyph, RichTextBoxState, StyledChar, EMBEDDED_IMAGE_OBJECT_CHAR, PT_TO_PX,
     };
     use eframe::egui::Color32;
 
@@ -2685,7 +3118,10 @@ mod tests {
         assert_eq!(state.plain_text(), "\t•\tItem\n\t•\t");
         assert_eq!(state.cursor_index, state.chars.len());
         assert_eq!(
-            state.chars.last().and_then(|entry| entry.paragraph_style.list_marker),
+            state
+                .chars
+                .last()
+                .and_then(|entry| entry.paragraph_style.list_marker),
             Some('•')
         );
 
@@ -2726,7 +3162,10 @@ mod tests {
         assert_eq!(state.plain_text(), "\t3.\tItem\n\t4.\t");
         assert_eq!(state.cursor_index, state.chars.len());
         assert_eq!(
-            state.chars.last().and_then(|entry| entry.paragraph_style.list_number),
+            state
+                .chars
+                .last()
+                .and_then(|entry| entry.paragraph_style.list_number),
             Some(4)
         );
     }
@@ -2959,6 +3398,27 @@ mod tests {
     }
 
     #[test]
+    fn highlight_color_updates_selected_chars() {
+        let mut state = RichTextBoxState::new("abcd");
+        state.selection_anchor = Some(1);
+        state.selection_focus = Some(3);
+
+        state.set_highlight_color(Some(Color32::YELLOW));
+
+        assert_eq!(state.chars[0].style.background_color, None);
+        assert_eq!(state.chars[1].style.background_color, Some(Color32::YELLOW));
+        assert_eq!(state.chars[2].style.background_color, Some(Color32::YELLOW));
+        assert_eq!(state.chars[3].style.background_color, None);
+        assert_eq!(state.typing_style.background_color, Some(Color32::YELLOW));
+
+        state.set_highlight_color(None);
+
+        assert_eq!(state.chars[1].style.background_color, None);
+        assert_eq!(state.chars[2].style.background_color, None);
+        assert_eq!(state.typing_style.background_color, None);
+    }
+
+    #[test]
     fn active_font_size_follows_cursor_position_without_selection() {
         let state = RichTextBoxState::from_styled_chars(vec![
             StyledChar::new(
@@ -2985,5 +3445,72 @@ mod tests {
 
         state.cursor_index = 2;
         assert_eq!(state.active_font_size(), 24.0);
+    }
+
+    #[test]
+    fn paragraph_layout_spec_uses_imported_margins_and_alignment() {
+        let entry = StyledChar::new(
+            'A',
+            InlineStyle::default(),
+            ParagraphStyle {
+                alignment: ParagraphAlignment::End,
+                margin_left: 10.0,
+                margin_right: 20.0,
+                line_height_percent: Some(130.0),
+                ..ParagraphStyle::default()
+            },
+        );
+
+        let spec = paragraph_layout_spec(&entry, 100.0, 500.0, &LayoutOptions::default());
+
+        assert_eq!(spec.left_x, 110.0);
+        assert_eq!(spec.width, 470.0);
+        assert_eq!(spec.alignment, ParagraphAlignment::End);
+        assert_eq!(spec.line_height_percent, Some(130.0));
+    }
+
+    #[test]
+    fn line_alignment_adjustment_right_aligns_remaining_width() {
+        let state = RichTextBoxState::new("abc");
+        let glyphs = [
+            PendingGlyph {
+                index: 0,
+                x: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            PendingGlyph {
+                index: 1,
+                x: 12.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        ];
+        let spec = ParagraphLayoutSpec {
+            left_x: 0.0,
+            width: 50.0,
+            alignment: ParagraphAlignment::End,
+            line_height_percent: None,
+        };
+
+        let (shift, justify_extra) = line_alignment_adjustments(&state, &glyphs, spec, true);
+
+        assert_eq!(shift, 28.0);
+        assert_eq!(justify_extra, 0.0);
+    }
+
+    #[test]
+    fn paragraph_spacing_collapses_only_the_imported_separator_newline() {
+        let paragraph_style = ParagraphStyle::default();
+        let state = RichTextBoxState::from_styled_chars(vec![
+            StyledChar::new('A', InlineStyle::default(), paragraph_style.clone()),
+            StyledChar::new('\n', InlineStyle::default(), paragraph_style.clone()),
+            StyledChar::new('\n', InlineStyle::default(), paragraph_style.clone()),
+            StyledChar::new('\n', InlineStyle::default(), paragraph_style),
+        ]);
+
+        assert!(!is_synthetic_paragraph_separator(&state, 1));
+        assert!(is_synthetic_paragraph_separator(&state, 2));
+        assert!(!is_synthetic_paragraph_separator(&state, 3));
     }
 }

@@ -335,7 +335,26 @@ impl LibeRustOfficeApp {
                                 }
                             ));
                             ui.separator();
-                            ui.label("Additional object/style settings can be added here.");
+                            ui.label("Layout");
+                            let alignment_response = ui.checkbox(
+                                &mut self.editor.layout_options.honor_paragraph_alignment,
+                                "Use paragraph alignment",
+                            );
+                            let spacing_response = ui.checkbox(
+                                &mut self.editor.layout_options.honor_paragraph_spacing,
+                                "Use paragraph spacing",
+                            );
+                            let cursor_response = ui.checkbox(
+                                &mut self.editor.layout_options.show_cursor_debug,
+                                "Show cursor index",
+                            );
+                            if alignment_response.changed()
+                                || spacing_response.changed()
+                                || cursor_response.changed()
+                            {
+                                self.editor.editor_active = false;
+                                self.save_status = "Updated render layout options".to_owned();
+                            }
                         }
                         RightPanelTab::Image => {
                             if let Some((image_index, image)) = self.editor.selected_image() {

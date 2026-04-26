@@ -121,6 +121,7 @@ struct StyleDefinition {
     italic: Option<bool>,
     underline: Option<bool>,
     color: Option<Color32>,
+    background_color: Option<Option<Color32>>,
     alignment: Option<ParagraphAlignment>,
     margin_left: Option<f32>,
     margin_right: Option<f32>,
@@ -396,9 +397,50 @@ impl StyleRegistry {
         if let Some(color) = definition.color {
             style.color = color;
         }
+        if let Some(background_color) = definition.background_color {
+            style.background_color = background_color;
+        }
 
         self.resolved_styles.insert(style_name.to_owned(), style);
         style
+    }
+
+    fn resolve_span_style(&self, style_name: Option<&str>, base_style: InlineStyle) -> InlineStyle {
+        let Some(style_name) = style_name else {
+            return base_style;
+        };
+
+        let mut style = base_style;
+        self.apply_named_text_style_over(style_name, &mut style);
+        style
+    }
+
+    fn apply_named_text_style_over(&self, style_name: &str, style: &mut InlineStyle) {
+        let Some(definition) = self.styles.get(style_name) else {
+            return;
+        };
+
+        if let Some(parent_name) = definition.parent_name.as_deref() {
+            self.apply_named_text_style_over(parent_name, style);
+        }
+        if let Some(font_size) = definition.font_size {
+            style.font_size = font_size;
+        }
+        if let Some(bold) = definition.bold {
+            style.bold = bold;
+        }
+        if let Some(italic) = definition.italic {
+            style.italic = italic;
+        }
+        if let Some(underline) = definition.underline {
+            style.underline = underline;
+        }
+        if let Some(color) = definition.color {
+            style.color = color;
+        }
+        if let Some(background_color) = definition.background_color {
+            style.background_color = background_color;
+        }
     }
 
     fn resolve_graphic_style(&mut self, style_name: Option<&str>) -> GraphicStyle {
@@ -591,9 +633,8 @@ fn extract_document_content(
 
         if tag.starts_with(LIST_OPEN_TAG) && !tag.starts_with(LIST_STYLE_OPEN_TAG) {
             let list_style_name = attribute_value(tag, "text:style-name");
-            if let Some((style_name, list_style)) = list_style_name
-                .as_deref()
-                .and_then(|style_name| {
+            if let Some((style_name, list_style)) =
+                list_style_name.as_deref().and_then(|style_name| {
                     styles
                         .list_styles
                         .get(style_name)
@@ -708,7 +749,11 @@ fn extract_document_content(
             style_stack.push(styles.default_style);
             current_paragraph_style = styles.default_paragraph_style.clone();
         } else if in_text_block && tag.starts_with(SPAN_OPEN_TAG) {
-            let style = styles.resolve_style(attribute_value(tag, "text:style-name").as_deref());
+            let parent_style = *style_stack.last().unwrap_or(&current_block_style);
+            let style = styles.resolve_span_style(
+                attribute_value(tag, "text:style-name").as_deref(),
+                parent_style,
+            );
             style_stack.push(style);
         } else if in_text_block && tag == SPAN_CLOSE_TAG {
             if style_stack.len() > 1 {
@@ -890,6 +935,9 @@ fn apply_text_properties_from_body(style: &mut InlineStyle, body: &str) {
         if let Some(color) = parse_color(tag) {
             style.color = color;
         }
+        if let Some(background_color) = parse_background_color(tag) {
+            style.background_color = background_color;
+        }
     }
 }
 
@@ -900,6 +948,7 @@ fn apply_text_properties_to_definition(definition: &mut StyleDefinition, body: &
         definition.italic = parse_font_style(tag);
         definition.underline = parse_underline(tag);
         definition.color = parse_color(tag);
+        definition.background_color = parse_background_color(tag);
     }
 }
 
@@ -1079,6 +1128,18 @@ fn parse_list_number_style(list_style_body: &str) -> Option<ListStyleDefinition>
 
 fn parse_color(tag: &str) -> Option<Color32> {
     let value = attribute_value(tag, "fo:color")?;
+    parse_hex_color(&value)
+}
+
+fn parse_background_color(tag: &str) -> Option<Option<Color32>> {
+    let value = attribute_value(tag, "fo:background-color")?;
+    if value == "transparent" || value == "none" {
+        return Some(None);
+    }
+    parse_hex_color(&value).map(Some)
+}
+
+fn parse_hex_color(value: &str) -> Option<Color32> {
     let hex = value.strip_prefix('#')?;
     if hex.len() != 6 {
         return None;
@@ -1358,8 +1419,7 @@ fn collect_export_paragraph_styles(chars: &[StyledChar]) -> Vec<ParagraphStyle> 
         paragraph_style.list_marker = None;
         paragraph_style.list_number = None;
 
-        if !styles.iter().any(|style| *style == paragraph_style)
-        {
+        if !styles.iter().any(|style| *style == paragraph_style) {
             styles.push(paragraph_style);
         }
     }
@@ -1379,7 +1439,9 @@ fn collect_export_paragraph_styles(chars: &[StyledChar]) -> Vec<ParagraphStyle> 
             .get(line_start..line_end)
             .and_then(|line_chars| line_chars.first())
             .map(|entry| entry.paragraph_style.clone());
-        let next_line_style = chars.get(line_end + 1).map(|entry| entry.paragraph_style.clone());
+        let next_line_style = chars
+            .get(line_end + 1)
+            .map(|entry| entry.paragraph_style.clone());
         if let Some(line_style) = line_style {
             if line_style.list_marker.is_some() {
                 let list_item_style = paragraph_style_for_generated_list_item(line_style);
@@ -1561,7 +1623,8 @@ fn export_paragraphs(
 
     while index < chars.len() {
         if !paragraph_has_content {
-            if let Some(prefix_len) = export_list_prefix_len(&chars[index..], &current_paragraph_style)
+            if let Some(prefix_len) =
+                export_list_prefix_len(&chars[index..], &current_paragraph_style)
             {
                 index += prefix_len;
                 continue;
@@ -1606,10 +1669,7 @@ fn export_paragraphs(
                 };
                 if paragraph_has_content || !current_is_list_block {
                     paragraphs.push(if entering_list_block || current_is_list_block {
-                        ExportParagraph::empty(
-                            std::mem::take(&mut paragraph_xml),
-                            paragraph_style,
-                        )
+                        ExportParagraph::empty(std::mem::take(&mut paragraph_xml), paragraph_style)
                     } else {
                         ExportParagraph::from_content(
                             std::mem::take(&mut paragraph_xml),
@@ -1887,8 +1947,12 @@ impl ExportStyleRegistry {
     fn as_xml(&self) -> String {
         let mut xml = String::new();
         for (style, name) in &self.styles {
+            let background_attribute = style
+                .background_color
+                .map(|color| format!(" fo:background-color=\"#{}\"", style_color_hex(color)))
+                .unwrap_or_default();
             xml.push_str(&format!(
-                "    <style:style style:name=\"{name}\" style:family=\"text\"><style:text-properties fo:font-size=\"{:.2}pt\" fo:font-weight=\"{}\" fo:font-style=\"{}\" style:text-underline-style=\"{}\" fo:color=\"#{}\"/></style:style>\n",
+                "    <style:style style:name=\"{name}\" style:family=\"text\"><style:text-properties fo:font-size=\"{:.2}pt\" fo:font-weight=\"{}\" fo:font-style=\"{}\" style:text-underline-style=\"{}\" fo:color=\"#{}\"{background_attribute}/></style:style>\n",
                 style.font_size / PT_TO_PX,
                 if style.bold { "bold" } else { "normal" },
                 if style.italic { "italic" } else { "normal" },
@@ -1913,8 +1977,7 @@ mod tests {
     };
     use crate::rich_textbox::{
         InlineStyle, ParagraphAlignment, ParagraphKind, ParagraphStyle, RichTextBoxState,
-        StyledChar,
-        EMBEDDED_IMAGE_OBJECT_CHAR, SOFT_PAGE_BREAK_CHAR,
+        StyledChar, EMBEDDED_IMAGE_OBJECT_CHAR, SOFT_PAGE_BREAK_CHAR,
     };
     use eframe::egui::Color32;
     use std::fs;
@@ -1928,7 +1991,7 @@ mod tests {
                   <office:text>
                     <text:h text:outline-level="2">Title</text:h>
                     <text:p><text:span>Alpha</text:span> beta</text:p>
-                  <text:p><draw:frame svg:width="5.3335in" svg:height="3.4835in"><draw:image xlink:href="Pictures/liberustoffice-image-1.png"/></draw:frame></text:p>
+                  <text:p><draw:frame svg:width="5.3335in" svg:height="3.4835in"><draw:image xlink:href="Pictures/100000000000064000000415424CE288.jpg"/></draw:frame></text:p>
                   <text:p><text:soft-page-break/>After break</text:p>
                 </office:text>
               </office:body>
@@ -1970,6 +2033,9 @@ mod tests {
                 <style:style style:name="Strong_20_Emphasis" style:family="text">
                   <style:text-properties fo:font-weight="bold" style:text-underline-style="solid" fo:color="#000080"/>
                 </style:style>
+                <style:style style:name="RsidOnly" style:family="text">
+                  <style:text-properties officeooo:rsid="00140aac"/>
+                </style:style>
               </office:styles>
             </office:document-styles>
         "##;
@@ -1981,6 +2047,7 @@ mod tests {
               <office:body>
                 <office:text>
                   <text:h text:style-name="P2">Title</text:h>
+                  <text:h text:style-name="P2"><text:span text:style-name="RsidOnly">Inherited</text:span>?</text:h>
                   <text:p><text:span text:style-name="Strong_20_Emphasis">Bold</text:span></text:p>
                 </office:text>
               </office:body>
@@ -2002,6 +2069,13 @@ mod tests {
             ParagraphKind::Heading { outline_level: 2 }
         );
         assert_eq!(chars[0].paragraph_style.style_name, "P2");
+
+        let inherited_char = chars
+            .iter()
+            .find(|entry| entry.value == 'I')
+            .expect("heading span char should exist");
+        assert_eq!(inherited_char.style.font_size, 16.0 * 4.0 / 3.0);
+        assert!(inherited_char.style.bold);
 
         let bold_char = chars
             .iter()
@@ -2028,8 +2102,7 @@ mod tests {
         assert!(text.contains("•\tItem 1"));
         assert!(document.chars.iter().any(|entry| {
             entry.value == '•'
-                && entry.paragraph_style.list_style_name.as_deref()
-                    == Some("LroBulletList")
+                && entry.paragraph_style.list_style_name.as_deref() == Some("L1")
                 && entry.paragraph_style.list_marker == Some('•')
         }));
         assert!(text.contains(EMBEDDED_IMAGE_OBJECT_CHAR));
@@ -2086,7 +2159,10 @@ mod tests {
 
         let text = chars.iter().map(|entry| entry.value).collect::<String>();
         assert_eq!(text, "\t3.\tFirst\n\t4.\tSecond");
-        assert_eq!(chars[1].paragraph_style.list_style_name.as_deref(), Some("NumberedList"));
+        assert_eq!(
+            chars[1].paragraph_style.list_style_name.as_deref(),
+            Some("NumberedList")
+        );
         assert_eq!(chars[1].paragraph_style.list_marker, Some('.'));
         assert_eq!(chars[1].paragraph_style.list_number, Some(3));
 
@@ -2112,6 +2188,7 @@ mod tests {
                     italic: true,
                     underline: true,
                     color: Color32::from_rgb(12, 34, 56),
+                    background_color: Some(Color32::from_rgb(250, 240, 120)),
                 },
                 ParagraphStyle::default(),
             ),
@@ -2123,6 +2200,7 @@ mod tests {
                     italic: true,
                     underline: true,
                     color: Color32::from_rgb(12, 34, 56),
+                    background_color: Some(Color32::from_rgb(250, 240, 120)),
                 },
                 ParagraphStyle::default(),
             ),
@@ -2145,6 +2223,10 @@ mod tests {
         assert!(reloaded.chars[0].style.italic);
         assert!(reloaded.chars[0].style.underline);
         assert_eq!(reloaded.chars[0].style.color, Color32::from_rgb(12, 34, 56));
+        assert_eq!(
+            reloaded.chars[0].style.background_color,
+            Some(Color32::from_rgb(250, 240, 120))
+        );
     }
 
     #[test]
@@ -2349,7 +2431,8 @@ mod tests {
         assert!(!content_xml.contains("<text:tab/>•<text:tab/>"));
 
         save_document_to_odt(&export_path, &chars, &[]).expect("bullet list document should save");
-        let reloaded = load_document_from_odt(&export_path).expect("saved bullet list should reopen");
+        let reloaded =
+            load_document_from_odt(&export_path).expect("saved bullet list should reopen");
         let _ = fs::remove_file(&export_path);
 
         let text = reloaded
@@ -2359,7 +2442,8 @@ mod tests {
             .collect::<String>();
         assert_eq!(text, "\t•\tA\n\t•\tB");
         assert!(reloaded.chars.iter().any(|entry| {
-            entry.value == '•' && entry.paragraph_style.list_style_name.as_deref() == Some("LroBulletList")
+            entry.value == '•'
+                && entry.paragraph_style.list_style_name.as_deref() == Some("LroBulletList")
         }));
 
         let mut state = RichTextBoxState::from_styled_document(reloaded.chars, reloaded.images);
@@ -2394,13 +2478,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         let content_xml = export_content_xml(&chars, &[]);
-        assert!(content_xml.contains(
-            "<text:p text:style-name=\"P14LroBeforeList\">Sample Bulletpoint:</text:p>"
-        ));
+        assert!(content_xml
+            .contains("<text:p text:style-name=\"P14LroBeforeList\">Sample Bulletpoint:</text:p>"));
         assert!(content_xml.contains("<text:list text:style-name=\"LroBulletList\">"));
         assert!(content_xml.contains("<text:list-item><text:p text:style-name=\"P14LroListItem\">Item 1</text:p></text:list-item>"));
         assert!(content_xml.contains("<text:list-item><text:p text:style-name=\"P14LroListItem\">Item 2</text:p></text:list-item>"));
-        assert!(!content_xml.contains("<text:list-item><text:p text:style-name=\"P14LroListItem\"></text:p></text:list-item>"));
+        assert!(!content_xml.contains(
+            "<text:list-item><text:p text:style-name=\"P14LroListItem\"></text:p></text:list-item>"
+        ));
         assert!(!content_xml.contains("<text:tab/>•<text:tab/>"));
 
         save_document_to_odt(&export_path, &chars, &[])
@@ -2412,8 +2497,9 @@ mod tests {
         assert!(saved_content_xml.contains("<text:list text:style-name=\"LroBulletList\">"));
         assert!(saved_content_xml
             .contains("<text:list-item><text:p text:style-name=\"P14LroListItem\">Item 1</text:p></text:list-item>"));
-        assert!(!saved_content_xml
-            .contains("<text:list-item><text:p text:style-name=\"P14LroListItem\"></text:p></text:list-item>"));
+        assert!(!saved_content_xml.contains(
+            "<text:list-item><text:p text:style-name=\"P14LroListItem\"></text:p></text:list-item>"
+        ));
         assert!(!saved_content_xml.contains("<text:tab/>•<text:tab/>"));
     }
 
