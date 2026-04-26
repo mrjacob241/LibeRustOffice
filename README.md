@@ -14,7 +14,7 @@
 - [ ] Font customization (size, family, color)
 - [x] Bullet and numbered lists
 - [ ] Headings and document structure support
-- [x] Insert images into documents
+- [x] Insert and resize images into documents
 - [ ] Table creation and editing
 - [ ] Hyperlink support
 - [ ] Undo / Redo functionality

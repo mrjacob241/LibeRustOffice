@@ -586,8 +586,13 @@ impl LibeRustOfficeApp {
 }
 
 fn open_document_or_fallback(path: impl AsRef<Path>) -> Result<RichTextBoxState, OdtLoadError> {
-    load_document_from_odt(path)
-        .map(|document| RichTextBoxState::from_styled_document(document.chars, document.images))
+    load_document_from_odt(path).map(|document| {
+        RichTextBoxState::from_styled_document_with_page_margins(
+            document.chars,
+            document.images,
+            document.page_margins,
+        )
+    })
 }
 
 fn empty_menu(ui: &mut egui::Ui, label: &str) {

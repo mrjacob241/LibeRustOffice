@@ -1,6 +1,6 @@
 use crate::rich_textbox::{
-    DocumentImage, InlineStyle, ParagraphAlignment, ParagraphKind, ParagraphStyle, StyledChar,
-    EMBEDDED_IMAGE_OBJECT_CHAR, SOFT_PAGE_BREAK_CHAR,
+    DocumentImage, InlineStyle, PageMargins, ParagraphAlignment, ParagraphKind, ParagraphStyle,
+    StyledChar, EMBEDDED_IMAGE_OBJECT_CHAR, SOFT_PAGE_BREAK_CHAR,
 };
 use eframe::egui::{self, Color32, Vec2};
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
@@ -53,6 +53,7 @@ const PT_TO_PX: f32 = 4.0 / 3.0;
 const IN_TO_PX: f32 = 96.0;
 const CM_TO_PX: f32 = IN_TO_PX / 2.54;
 const MM_TO_PX: f32 = CM_TO_PX / 10.0;
+const DOCUMENT_PAGE_MARGIN_SCALE: f32 = 0.625;
 
 #[derive(Debug)]
 pub enum OdtLoadError {
@@ -167,6 +168,7 @@ struct ActiveListState {
 pub struct OdtDocument {
     pub chars: Vec<StyledChar>,
     pub images: Vec<DocumentImage>,
+    pub page_margins: PageMargins,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,7 +182,9 @@ pub fn load_document_from_odt(path: impl AsRef<Path>) -> Result<OdtDocument, Odt
     let styles_xml = read_zip_entry(path, STYLES_XML_ENTRY)?;
     let content_xml = read_zip_entry(path, CONTENT_XML_ENTRY)?;
     let mut styles = StyleRegistry::from_xml(&styles_xml, &content_xml);
-    extract_document_content(path, &content_xml, &mut styles)
+    let mut document = extract_document_content(path, &content_xml, &mut styles)?;
+    document.page_margins = parse_page_margins_from_xml(&styles_xml).unwrap_or_default();
+    Ok(document)
 }
 
 pub fn load_styled_text_from_odt(path: impl AsRef<Path>) -> Result<Vec<StyledChar>, OdtLoadError> {
@@ -818,7 +822,11 @@ fn extract_document_content(
             }
         }
     }
-    Ok(OdtDocument { chars, images })
+    Ok(OdtDocument {
+        chars,
+        images,
+        page_margins: PageMargins::default(),
+    })
 }
 
 fn normalize_tab_prefixed_list_metadata_for_export(chars: &mut [StyledChar]) {
@@ -1158,6 +1166,26 @@ fn parse_frame_size(tag: &str) -> Option<Vec2> {
     Some(egui::vec2(width, height))
 }
 
+fn parse_page_margins_from_xml(styles_xml: &str) -> Option<PageMargins> {
+    let tag_start = styles_xml.find("<style:page-layout-properties")?;
+    let tag_end = styles_xml[tag_start..]
+        .find('>')
+        .map(|offset| tag_start + offset + 1)?;
+    let tag = &styles_xml[tag_start..tag_end];
+
+    let left_px = parse_length_to_px(attribute_value(tag, "fo:margin-left").as_deref())?;
+    let right_px = parse_length_to_px(attribute_value(tag, "fo:margin-right").as_deref())?;
+    let top_px = parse_length_to_px(attribute_value(tag, "fo:margin-top").as_deref())?;
+    let bottom_px = parse_length_to_px(attribute_value(tag, "fo:margin-bottom").as_deref())?;
+
+    Some(PageMargins {
+        left_cm: px_to_cm(left_px) * DOCUMENT_PAGE_MARGIN_SCALE,
+        right_cm: px_to_cm(right_px) * DOCUMENT_PAGE_MARGIN_SCALE,
+        top_cm: px_to_cm(top_px) * DOCUMENT_PAGE_MARGIN_SCALE,
+        bottom_cm: px_to_cm(bottom_px) * DOCUMENT_PAGE_MARGIN_SCALE,
+    })
+}
+
 fn parse_length_to_px(value: Option<&str>) -> Option<f32> {
     let value = value?;
     if let Some(raw) = value.strip_suffix("in") {
@@ -1173,6 +1201,10 @@ fn parse_length_to_px(value: Option<&str>) -> Option<f32> {
         return Some(raw.parse::<f32>().ok()? * PT_TO_PX);
     }
     value.strip_suffix("px")?.parse::<f32>().ok()
+}
+
+fn px_to_cm(value: f32) -> f32 {
+    value / CM_TO_PX
 }
 
 fn load_document_image(
@@ -2110,6 +2142,10 @@ mod tests {
         assert!(document.images[0].size.x > 400.0);
         assert!(document.images[0].size.y > 250.0);
         assert!(document.images[0].center_horizontally);
+        assert!((document.page_margins.left_cm - 1.25).abs() < 0.01);
+        assert!((document.page_margins.right_cm - 1.25).abs() < 0.01);
+        assert!((document.page_margins.top_cm - 1.25).abs() < 0.01);
+        assert!((document.page_margins.bottom_cm - 1.25).abs() < 0.01);
 
         let heading_char = document
             .chars

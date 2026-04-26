@@ -28,6 +28,7 @@ const MIN_PAGE_SCALE: f32 = 0.5;
 const MAX_PAGE_SCALE: f32 = 2.0;
 const PAGE_SCALE_STEP: f32 = 0.1;
 const RULER_BAR_HEIGHT: f32 = 24.0;
+const RULER_BAR_BOTTOM_GAP: f32 = 6.0;
 const STATUS_BAR_TOP_GAP: f32 = 6.0;
 const STATUS_BAR_HEIGHT: f32 = 28.0;
 const TOOLBAR_HOVER_EXPAND: f32 = 2.0;
@@ -37,6 +38,8 @@ const ROW_Y_EPSILON: f32 = 2.0;
 const EMBEDDED_IMAGE_GAP_Y: f32 = 18.0;
 const IMAGE_SELECTION_STROKE_WIDTH: f32 = 1.8;
 const IMAGE_SELECTION_HANDLE_RADIUS: f32 = 4.5;
+const IMAGE_SELECTION_HANDLE_HIT_RADIUS: f32 = 14.0;
+const IMAGE_MIN_SIZE: f32 = 24.0;
 const MIN_FONT_SIZE_PT: f32 = 9.0;
 const MAX_FONT_SIZE_PT: f32 = 27.0;
 pub const EMBEDDED_IMAGE_OBJECT_CHAR: char = '\u{FFFC}';
@@ -108,6 +111,25 @@ pub enum ParagraphAlignment {
 impl Default for ParagraphAlignment {
     fn default() -> Self {
         Self::Start
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageMargins {
+    pub left_cm: f32,
+    pub right_cm: f32,
+    pub top_cm: f32,
+    pub bottom_cm: f32,
+}
+
+impl Default for PageMargins {
+    fn default() -> Self {
+        Self {
+            left_cm: PAGE_HORIZONTAL_MARGIN_CM,
+            right_cm: PAGE_HORIZONTAL_MARGIN_CM,
+            top_cm: PAGE_TOP_MARGIN_CM,
+            bottom_cm: PAGE_BOTTOM_MARGIN_CM,
+        }
     }
 }
 
@@ -198,12 +220,41 @@ pub struct RichTextBoxState {
     pub cursor_index: usize,
     pub typing_style: InlineStyle,
     pub page_scale: f32,
+    pub page_margins: PageMargins,
     pub editor_active: bool,
     pub selection_anchor: Option<usize>,
     pub selection_focus: Option<usize>,
     pub edit_revision: u64,
     pub layout_options: LayoutOptions,
+    image_resize_drag: Option<ImageResizeDrag>,
     open_image_tab_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ImageResizeDrag {
+    image_index: usize,
+    handle: ImageResizeHandle,
+    start_pointer: Pos2,
+    start_size: Vec2,
+    page_scale: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageResizeHandle {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomRight,
+    BottomLeft,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ImageResizeHandleHit {
+    image_index: usize,
+    handle: ImageResizeHandle,
 }
 
 impl RichTextBoxState {
@@ -223,6 +274,14 @@ impl RichTextBoxState {
     }
 
     pub fn from_styled_document(chars: Vec<StyledChar>, images: Vec<DocumentImage>) -> Self {
+        Self::from_styled_document_with_page_margins(chars, images, PageMargins::default())
+    }
+
+    pub fn from_styled_document_with_page_margins(
+        chars: Vec<StyledChar>,
+        images: Vec<DocumentImage>,
+        page_margins: PageMargins,
+    ) -> Self {
         let typing_style = chars
             .last()
             .map(|entry| entry.style)
@@ -234,11 +293,13 @@ impl RichTextBoxState {
             images,
             typing_style,
             page_scale: 1.0,
+            page_margins,
             editor_active: true,
             selection_anchor: None,
             selection_focus: None,
             edit_revision: 0,
             layout_options: LayoutOptions::default(),
+            image_resize_drag: None,
             open_image_tab_requested: false,
         }
     }
@@ -488,6 +549,70 @@ impl RichTextBoxState {
         self.bump_edit_revision();
     }
 
+    fn start_image_resize_drag(
+        &mut self,
+        image_index: usize,
+        handle: ImageResizeHandle,
+        pointer_pos: Pos2,
+        page_scale: f32,
+    ) {
+        let Some(image) = self.images.get(image_index) else {
+            return;
+        };
+        self.open_image_tab_requested = true;
+        self.image_resize_drag = Some(ImageResizeDrag {
+            image_index,
+            handle,
+            start_pointer: pointer_pos,
+            start_size: image.size,
+            page_scale,
+        });
+    }
+
+    fn drag_image_resize_to(&mut self, pointer_pos: Pos2) -> bool {
+        let Some(drag) = self.image_resize_drag else {
+            return false;
+        };
+        let Some(image) = self.images.get_mut(drag.image_index) else {
+            self.image_resize_drag = None;
+            return false;
+        };
+
+        let delta = (pointer_pos - drag.start_pointer) / drag.page_scale.max(0.1);
+        let mut new_size = drag.start_size;
+        match drag.handle {
+            ImageResizeHandle::Left => {
+                new_size.x = drag.start_size.x - delta.x;
+            }
+            ImageResizeHandle::Right => {
+                new_size.x = drag.start_size.x + delta.x;
+            }
+            ImageResizeHandle::Top => {
+                new_size.y = drag.start_size.y - delta.y;
+            }
+            ImageResizeHandle::Bottom => {
+                new_size.y = drag.start_size.y + delta.y;
+            }
+            ImageResizeHandle::TopLeft
+            | ImageResizeHandle::TopRight
+            | ImageResizeHandle::BottomRight
+            | ImageResizeHandle::BottomLeft => {
+                new_size = diagonal_image_resize_size(drag.start_size, delta, drag.handle);
+            }
+        }
+
+        image.size = egui::vec2(
+            new_size.x.max(IMAGE_MIN_SIZE),
+            new_size.y.max(IMAGE_MIN_SIZE),
+        );
+        self.bump_edit_revision();
+        true
+    }
+
+    fn stop_image_resize_drag(&mut self) {
+        self.image_resize_drag = None;
+    }
+
     pub fn take_open_image_tab_request(&mut self) -> bool {
         let requested = self.open_image_tab_requested;
         self.open_image_tab_requested = false;
@@ -539,6 +664,14 @@ impl RichTextBoxState {
         self.apply_to_selection(|style| style.background_color = color);
     }
 
+    pub fn set_paragraph_alignment(&mut self, alignment: ParagraphAlignment) {
+        let target_range = self.selected_range().unwrap_or_else(|| {
+            let line_start = self.current_line_start_index();
+            line_start..self.current_line_end_index(line_start)
+        });
+        self.apply_paragraph_alignment_to_range(target_range, alignment);
+    }
+
     pub fn zoom_in_page(&mut self) {
         self.page_scale = ((self.page_scale + PAGE_SCALE_STEP) * 100.0).round() / 100.0;
         self.page_scale = self.page_scale.min(MAX_PAGE_SCALE);
@@ -587,6 +720,16 @@ impl RichTextBoxState {
         self.selected_range()
             .map(|range| self.chars[range.start].style.background_color)
             .unwrap_or_else(|| self.cursor_adjacent_style().background_color)
+    }
+
+    pub fn active_paragraph_alignment(&self) -> ParagraphAlignment {
+        self.selected_range()
+            .and_then(|range| {
+                self.chars
+                    .get(range.start)
+                    .map(|entry| entry.paragraph_style.alignment)
+            })
+            .unwrap_or_else(|| self.cursor_adjacent_paragraph_style().alignment)
     }
 
     pub fn active_bullet_list(&self) -> bool {
@@ -1015,6 +1158,41 @@ impl RichTextBoxState {
         }
     }
 
+    fn apply_paragraph_alignment_to_range(
+        &mut self,
+        range: Range<usize>,
+        alignment: ParagraphAlignment,
+    ) {
+        if self.chars.is_empty() {
+            return;
+        }
+
+        let mut line_start = range.start.min(self.chars.len());
+        while line_start > 0 && self.chars[line_start - 1].value != '\n' {
+            line_start -= 1;
+        }
+
+        let range_end = range.end.min(self.chars.len());
+        loop {
+            let line_end = self.current_line_end_index(line_start);
+            let mut paragraph_style = self
+                .chars
+                .get(line_start)
+                .or_else(|| self.chars.get(line_start.saturating_sub(1)))
+                .map(|entry| entry.paragraph_style.clone())
+                .unwrap_or_else(|| self.cursor_adjacent_paragraph_style());
+            paragraph_style.alignment = alignment;
+            self.apply_paragraph_style_to_line(line_start, line_end, paragraph_style);
+
+            if line_end >= range_end || line_end >= self.chars.len() {
+                break;
+            }
+            line_start = line_end + 1;
+        }
+
+        self.bump_edit_revision();
+    }
+
     fn clear_paragraph_style_from_line(&mut self, line_start: usize, line_end: usize) {
         for entry in &mut self.chars[line_start..line_end] {
             clear_paragraph_list_style(&mut entry.paragraph_style);
@@ -1353,8 +1531,8 @@ impl<'a> RichTextBox<'a> {
 impl Widget for RichTextBox<'_> {
     fn ui(self, ui: &mut Ui) -> egui::Response {
         let frame = egui::Frame::none()
-            .fill(Color32::from_rgb(247, 245, 240))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(210, 206, 198)))
+            .fill(Color32::from_rgb(35, 35, 35))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(55, 55, 55)))
             .rounding(8.0)
             .inner_margin(12.0);
 
@@ -1362,26 +1540,23 @@ impl Widget for RichTextBox<'_> {
             .show(ui, |ui| {
                 let viewport_width = ui.available_width();
                 let page_width = scaled_page_width(self.state.page_scale);
-                let canvas_width = (page_width + PAGE_SIDE_MARGIN * 2.0).max(viewport_width);
+                let canvas_width = editor_canvas_width(viewport_width, page_width);
 
-                let line_height = rendered_font_size(self.state.typing_style.font_size)
-                    * self.state.page_scale
-                    * 1.45;
-                let preferred_viewport_height = self.desired_rows as f32 * line_height;
-                let reserved_footer_height =
-                    STATUS_BAR_TOP_GAP + STATUS_BAR_HEIGHT + CANVAS_BOTTOM_VIEWPORT_PADDING;
-                let available_viewport_height =
-                    (ui.available_height() - reserved_footer_height).max(0.0);
-                let viewport_height = if available_viewport_height > 0.0 {
-                    available_viewport_height
-                } else {
-                    preferred_viewport_height
-                };
+                let reserved_fixed_height = RULER_BAR_HEIGHT
+                    + RULER_BAR_BOTTOM_GAP
+                    + STATUS_BAR_TOP_GAP
+                    + STATUS_BAR_HEIGHT
+                    + CANVAS_BOTTOM_VIEWPORT_PADDING;
+                let viewport_height = (ui.available_height() - reserved_fixed_height).max(1.0);
                 let keyboard_layout = layout_document(
                     ui,
                     self.state,
-                    logical_page_content_origin(Pos2::ZERO, self.state.page_scale),
-                    page_text_width(A4_PAGE_WIDTH),
+                    logical_page_content_origin(
+                        Pos2::ZERO,
+                        self.state.page_scale,
+                        self.state.page_margins,
+                    ),
+                    page_text_width(A4_PAGE_WIDTH, self.state.page_margins),
                     self.state.page_scale,
                 );
                 let zoom_shortcut_changed = consume_page_zoom_shortcut(ui, self.state);
@@ -1394,20 +1569,31 @@ impl Widget for RichTextBox<'_> {
                     && editor_canvas_has_focus
                     && consume_keyboard_input(ui, self.state, &keyboard_layout);
 
+                draw_editor_ruler_bar(
+                    ui,
+                    viewport_width,
+                    canvas_width,
+                    page_width,
+                    self.state.page_margins,
+                );
+                ui.add_space(RULER_BAR_BOTTOM_GAP);
+
                 let scroll_output = egui::ScrollArea::both()
                     .id_source(editor_scroll_area_id())
                     .auto_shrink([false, false])
                     .max_height(viewport_height)
                     .show(ui, |ui| {
                         ui.set_min_width(canvas_width);
-                        draw_ruler_bar(ui, canvas_width, page_width);
-                        ui.add_space(6.0);
 
                         let sizing_layout = layout_document(
                             ui,
                             self.state,
-                            logical_page_content_origin(Pos2::ZERO, self.state.page_scale),
-                            page_text_width(A4_PAGE_WIDTH),
+                            logical_page_content_origin(
+                                Pos2::ZERO,
+                                self.state.page_scale,
+                                self.state.page_margins,
+                            ),
+                            page_text_width(A4_PAGE_WIDTH, self.state.page_margins),
                             self.state.page_scale,
                         );
                         let canvas_size = egui::vec2(
@@ -1439,27 +1625,47 @@ impl Widget for RichTextBox<'_> {
                             logical_page_content_origin(
                                 page_rect.left_top(),
                                 self.state.page_scale,
+                                self.state.page_margins,
                             ),
-                            page_text_width(A4_PAGE_WIDTH),
+                            page_text_width(A4_PAGE_WIDTH, self.state.page_margins),
                             self.state.page_scale,
                         );
 
                         if let Some(pointer_pos) = response.interact_pointer_pos() {
+                            let hit_resize_handle = hit_test_selected_image_resize_handle(
+                                self.state,
+                                &hit_test_layout,
+                                pointer_pos,
+                            );
                             let hit_image_char_index =
                                 hit_test_image_char_index(&hit_test_layout, pointer_pos);
                             let hit_index = hit_image_char_index.unwrap_or_else(|| {
                                 nearest_cursor_index(&hit_test_layout, pointer_pos)
                             });
                             if response.drag_started() {
-                                if let Some(image_char_index) = hit_image_char_index {
+                                if let Some(hit) = hit_resize_handle {
+                                    self.state.open_image_tab_requested = true;
+                                    self.state.start_image_resize_drag(
+                                        hit.image_index,
+                                        hit.handle,
+                                        pointer_pos,
+                                        self.state.page_scale,
+                                    );
+                                } else if let Some(image_char_index) = hit_image_char_index {
                                     self.state.select_image_object(image_char_index);
                                 } else {
                                     self.state.set_selection_point(hit_index);
                                 }
+                            } else if response.dragged() && self.state.image_resize_drag.is_some() {
+                                if self.state.drag_image_resize_to(pointer_pos) {
+                                    ui.ctx().request_repaint();
+                                }
                             } else if response.dragged() {
                                 self.state.drag_selection_to(hit_index);
                             } else if response.clicked() {
-                                if let Some(image_char_index) = hit_image_char_index {
+                                if hit_resize_handle.is_some() {
+                                    self.state.open_image_tab_requested = true;
+                                } else if let Some(image_char_index) = hit_image_char_index {
                                     self.state.select_image_object(image_char_index);
                                 } else {
                                     self.state.cursor_index = hit_index;
@@ -1473,8 +1679,12 @@ impl Widget for RichTextBox<'_> {
                             }
                         }
 
-                        if response.drag_stopped() && self.state.selected_range().is_none() {
-                            self.state.clear_selection();
+                        if response.drag_stopped() {
+                            if self.state.image_resize_drag.is_some() {
+                                self.state.stop_image_resize_drag();
+                            } else if self.state.selected_range().is_none() {
+                                self.state.clear_selection();
+                            }
                         }
 
                         let paint_layout = layout_document(
@@ -1483,8 +1693,9 @@ impl Widget for RichTextBox<'_> {
                             logical_page_content_origin(
                                 page_rect.left_top(),
                                 self.state.page_scale,
+                                self.state.page_margins,
                             ),
-                            page_text_width(A4_PAGE_WIDTH),
+                            page_text_width(A4_PAGE_WIDTH, self.state.page_margins),
                             self.state.page_scale,
                         );
                         if zoom_shortcut_changed
@@ -1626,6 +1837,38 @@ pub fn draw_editor_toolbar(ui: &mut Ui, state: &mut RichTextBoxState) {
                 }
 
                 ui.separator();
+                let active_alignment = state.active_paragraph_alignment();
+                if toolbar_alignment_button(
+                    ui,
+                    "|← ",
+                    active_alignment == ParagraphAlignment::Start,
+                ) {
+                    state.set_paragraph_alignment(ParagraphAlignment::Start);
+                    focus_editor_canvas(ui);
+                }
+                if toolbar_alignment_button(
+                    ui,
+                    " ↔ ",
+                    active_alignment == ParagraphAlignment::Center,
+                ) {
+                    state.set_paragraph_alignment(ParagraphAlignment::Center);
+                    focus_editor_canvas(ui);
+                }
+                if toolbar_alignment_button(ui, " →|", active_alignment == ParagraphAlignment::End)
+                {
+                    state.set_paragraph_alignment(ParagraphAlignment::End);
+                    focus_editor_canvas(ui);
+                }
+                if toolbar_alignment_button(
+                    ui,
+                    "|↔|",
+                    active_alignment == ParagraphAlignment::Justify,
+                ) {
+                    state.set_paragraph_alignment(ParagraphAlignment::Justify);
+                    focus_editor_canvas(ui);
+                }
+
+                ui.separator();
                 if toolbar_toggle(ui, "• ◦ ▪", state.active_bullet_list(), false, false, false)
                 {
                     state.toggle_bullet_list();
@@ -1643,6 +1886,31 @@ pub fn draw_editor_toolbar(ui: &mut Ui, state: &mut RichTextBoxState) {
                     focus_editor_canvas(ui);
                 }
             });
+        });
+}
+
+fn draw_editor_ruler_bar(
+    ui: &mut Ui,
+    viewport_width: f32,
+    canvas_width: f32,
+    page_width: f32,
+    page_margins: PageMargins,
+) {
+    egui::Frame::none()
+        .fill(Color32::from_rgb(35, 35, 35))
+        .show(ui, |ui| {
+            let scroll_offset_x = egui::scroll_area::State::load(ui.ctx(), editor_scroll_area_id())
+                .map(|scroll_state| scroll_state.offset.x)
+                .unwrap_or(0.0);
+
+            draw_ruler_bar(
+                ui,
+                viewport_width,
+                canvas_width,
+                page_width,
+                page_margins,
+                scroll_offset_x,
+            );
         });
 }
 
@@ -1672,6 +1940,26 @@ fn toolbar_toggle(
     let response = ui
         .add(egui::Label::new(text).sense(Sense::click()))
         .on_hover_cursor(egui::CursorIcon::Default);
+    paint_toolbar_hover_box(ui, &response, active);
+    response.clicked()
+}
+
+fn toolbar_alignment_button(ui: &mut Ui, label: &str, active: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(34.0, 20.0), Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::Default);
+    let color = if active {
+        Color32::from_rgb(120, 190, 255)
+    } else {
+        Color32::from_rgb(240, 240, 240)
+    };
+
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::monospace(14.0),
+        color,
+    );
     paint_toolbar_hover_box(ui, &response, active);
     response.clicked()
 }
@@ -1836,27 +2124,40 @@ fn draw_status_bar(
     );
 }
 
-fn draw_ruler_bar(ui: &mut Ui, viewport_width: f32, page_width: f32) {
+fn draw_ruler_bar(
+    ui: &mut Ui,
+    viewport_width: f32,
+    canvas_width: f32,
+    page_width: f32,
+    page_margins: PageMargins,
+    scroll_offset_x: f32,
+) {
     let (ruler_rect, _response) =
         ui.allocate_exact_size(egui::vec2(viewport_width, RULER_BAR_HEIGHT), Sense::hover());
-    let page_left = ruler_rect.left() + ((ruler_rect.width() - page_width) * 0.5).max(0.0);
+    let page_left =
+        ruler_rect.left() - scroll_offset_x + ((canvas_width - page_width) * 0.5).max(0.0);
     let page_rect = Rect::from_min_size(
         Pos2::new(page_left, ruler_rect.top()),
         egui::vec2(page_width, ruler_rect.height()),
     );
-    let margin_width = page_text_margin_x(page_width);
     let content_rect = Rect::from_min_max(
-        Pos2::new(page_rect.left() + margin_width, page_rect.top()),
-        Pos2::new(page_rect.right() - margin_width, page_rect.bottom()),
+        Pos2::new(
+            page_rect.left() + page_text_margin_left(page_width, page_margins),
+            page_rect.top(),
+        ),
+        Pos2::new(
+            page_rect.right() - page_text_margin_right(page_width, page_margins),
+            page_rect.bottom(),
+        ),
     );
 
     ui.painter()
-        .rect_filled(ruler_rect, 4.0, Color32::from_rgb(227, 224, 218));
-    ui.painter()
-        .rect_filled(page_rect, 4.0, Color32::from_rgb(210, 210, 210));
-    ui.painter()
-        .rect_filled(content_rect, 0.0, Color32::from_rgb(242, 242, 242));
-    ui.painter().rect_stroke(
+        .rect_filled(ruler_rect, 0.0, Color32::from_rgb(35, 35, 35));
+
+    let ruler_painter = ui.painter().with_clip_rect(ruler_rect);
+    ruler_painter.rect_filled(page_rect, 4.0, Color32::from_rgb(210, 210, 210));
+    ruler_painter.rect_filled(content_rect, 0.0, Color32::from_rgb(242, 242, 242));
+    ruler_painter.rect_stroke(
         page_rect,
         4.0,
         Stroke::new(1.0, Color32::from_rgb(140, 140, 140)),
@@ -1870,7 +2171,7 @@ fn draw_ruler_bar(ui: &mut Ui, viewport_width: f32, page_width: f32) {
         } else {
             page_rect.top() + 10.0
         };
-        ui.painter().line_segment(
+        ruler_painter.line_segment(
             [
                 Pos2::new(x, tick_top),
                 Pos2::new(x, page_rect.bottom() - 4.0),
@@ -1880,7 +2181,7 @@ fn draw_ruler_bar(ui: &mut Ui, viewport_width: f32, page_width: f32) {
     }
 
     for marker_x in [content_rect.left(), content_rect.right()] {
-        ui.painter().line_segment(
+        ruler_painter.line_segment(
             [
                 Pos2::new(marker_x, page_rect.top() + 2.0),
                 Pos2::new(marker_x, page_rect.bottom() - 2.0),
@@ -1894,6 +2195,10 @@ fn scaled_page_width(page_scale: f32) -> f32 {
     A4_PAGE_WIDTH * page_scale.clamp(MIN_PAGE_SCALE, MAX_PAGE_SCALE)
 }
 
+fn editor_canvas_width(viewport_width: f32, page_width: f32) -> f32 {
+    (page_width + PAGE_SIDE_MARGIN * 2.0).max(viewport_width)
+}
+
 fn scaled_page_height(page_scale: f32) -> f32 {
     A4_PAGE_HEIGHT * page_scale.clamp(MIN_PAGE_SCALE, MAX_PAGE_SCALE)
 }
@@ -1902,33 +2207,40 @@ fn scaled_page_gap(page_scale: f32) -> f32 {
     PAGE_GAP * page_scale.clamp(MIN_PAGE_SCALE, MAX_PAGE_SCALE)
 }
 
-fn page_text_margin_x(page_width: f32) -> f32 {
-    page_width * (PAGE_HORIZONTAL_MARGIN_CM / A4_PAGE_WIDTH_CM)
+fn page_text_margin_left(page_width: f32, margins: PageMargins) -> f32 {
+    page_width * (margins.left_cm / A4_PAGE_WIDTH_CM)
 }
 
-fn page_text_width(page_width: f32) -> f32 {
-    (page_width - page_text_margin_x(page_width) * 2.0).max(120.0)
+fn page_text_margin_right(page_width: f32, margins: PageMargins) -> f32 {
+    page_width * (margins.right_cm / A4_PAGE_WIDTH_CM)
 }
 
-fn page_text_margin_top(page_scale: f32) -> f32 {
-    scaled_page_height(page_scale) * (PAGE_TOP_MARGIN_CM / A4_PAGE_HEIGHT_CM)
-}
-
-fn page_text_margin_bottom(page_scale: f32) -> f32 {
-    scaled_page_height(page_scale) * (PAGE_BOTTOM_MARGIN_CM / A4_PAGE_HEIGHT_CM)
-}
-
-fn page_text_height(page_scale: f32) -> f32 {
-    (scaled_page_height(page_scale)
-        - page_text_margin_top(page_scale)
-        - page_text_margin_bottom(page_scale))
+fn page_text_width(page_width: f32, margins: PageMargins) -> f32 {
+    (page_width
+        - page_text_margin_left(page_width, margins)
+        - page_text_margin_right(page_width, margins))
     .max(120.0)
 }
 
-fn logical_page_content_origin(page_top_left: Pos2, page_scale: f32) -> Pos2 {
+fn page_text_margin_top(page_scale: f32, margins: PageMargins) -> f32 {
+    scaled_page_height(page_scale) * (margins.top_cm / A4_PAGE_HEIGHT_CM)
+}
+
+fn page_text_margin_bottom(page_scale: f32, margins: PageMargins) -> f32 {
+    scaled_page_height(page_scale) * (margins.bottom_cm / A4_PAGE_HEIGHT_CM)
+}
+
+fn page_text_height(page_scale: f32, margins: PageMargins) -> f32 {
+    (scaled_page_height(page_scale)
+        - page_text_margin_top(page_scale, margins)
+        - page_text_margin_bottom(page_scale, margins))
+    .max(120.0)
+}
+
+fn logical_page_content_origin(page_top_left: Pos2, page_scale: f32, margins: PageMargins) -> Pos2 {
     Pos2::new(
-        page_top_left.x / page_scale + page_text_margin_x(A4_PAGE_WIDTH),
-        page_top_left.y / page_scale + page_text_margin_top(1.0),
+        page_top_left.x / page_scale + page_text_margin_left(A4_PAGE_WIDTH, margins),
+        page_top_left.y / page_scale + page_text_margin_top(1.0, margins),
     )
 }
 
@@ -2070,6 +2382,7 @@ fn layout_document(
     let fallback_line_height =
         rendered_font_size(state.typing_style.font_size) + LINE_BOTTOM_PADDING;
     let fallback_caret_height = rendered_font_size(state.typing_style.font_size);
+    let page_content_height = page_text_height(1.0, state.page_margins);
     let mut line_height = 0.0_f32;
     let mut line_caret_height = 0.0_f32;
     let mut image_object_index = 0;
@@ -2125,6 +2438,7 @@ fn layout_document(
                     resolved_line_height_for_spec(line_height, fallback_line_height, line_spec),
                     fallback_line_height,
                     origin.y,
+                    page_content_height,
                 );
                 line_height = 0.0;
                 line_caret_height = 0.0;
@@ -2142,7 +2456,9 @@ fn layout_document(
                     line_spec.left_x + image.margin_left
                 };
 
-                if pen_y + image_size.y > current_page_content_bottom(pen_y, origin.y) {
+                if pen_y + image_size.y
+                    > current_page_content_bottom(pen_y, origin.y, page_content_height)
+                {
                     let page_stride = A4_PAGE_HEIGHT + PAGE_GAP;
                     let next_page_index = ((pen_y - origin.y) / page_stride).floor().max(0.0) + 1.0;
                     pen_y = origin.y + next_page_index * page_stride;
@@ -2211,6 +2527,7 @@ fn layout_document(
                 resolved_line_height_for_spec(line_height, fallback_line_height, line_spec),
                 fallback_line_height,
                 origin.y,
+                page_content_height,
             );
             line_height = 0.0;
             line_caret_height = 0.0;
@@ -2252,6 +2569,7 @@ fn layout_document(
                 resolved_line_height_for_spec(line_height, fallback_line_height, line_spec),
                 fallback_line_height,
                 origin.y,
+                page_content_height,
             );
             if state.layout_options.honor_paragraph_spacing {
                 pen_y += entry.paragraph_style.margin_bottom.max(0.0);
@@ -2264,39 +2582,8 @@ fn layout_document(
         }
 
         if entry.value == SOFT_PAGE_BREAK_CHAR {
-            if !pending_glyphs.is_empty() {
-                pending_cursor_slots.push((index, pen_x));
-                flush_pending_line(
-                    state,
-                    &mut render_boxes,
-                    &mut cursor_points,
-                    &pending_glyphs,
-                    &pending_cursor_slots,
-                    pen_y,
-                    line_height,
-                    line_caret_height,
-                    fallback_line_height,
-                    fallback_caret_height,
-                    line_spec,
-                    page_scale,
-                    false,
-                );
-                pending_glyphs.clear();
-                pending_cursor_slots.clear();
-            }
-
-            let page_stride = A4_PAGE_HEIGHT + PAGE_GAP;
-            let current_page_index =
-                ((latest_visible_content_bottom(&render_boxes, pen_y) - origin.y) / page_stride)
-                    .floor()
-                    .max(0.0);
-            pen_x = line_spec.left_x;
-            pen_y = origin.y + (current_page_index + 1.0) * page_stride;
-            line_height = 0.0;
-            line_caret_height = 0.0;
             cursor_points[index] = Pos2::new(pen_x * page_scale, pen_y * page_scale);
             cursor_points[index + 1] = Pos2::new(pen_x * page_scale, pen_y * page_scale);
-            pending_cursor_slots.clear();
             pending_cursor_slots.push((index + 1, pen_x));
             continue;
         }
@@ -2378,15 +2665,6 @@ fn document_visual_bottom(
     }
 
     visual_bottom - document_origin_y
-}
-
-fn latest_visible_content_bottom(render_boxes: &[RenderBox], fallback_y: f32) -> f32 {
-    render_boxes
-        .iter()
-        .rev()
-        .find(|render_box| !render_box.is_line_break())
-        .map(|render_box| render_box.local_rect.bottom())
-        .unwrap_or(fallback_y)
 }
 
 fn is_synthetic_paragraph_separator(state: &RichTextBoxState, index: usize) -> bool {
@@ -2627,6 +2905,7 @@ fn advance_to_next_line_y(
     current_line_height: f32,
     fallback_line_height: f32,
     document_origin_y: f32,
+    page_content_height: f32,
 ) -> f32 {
     let next_line_y =
         current_line_top_y + resolved_line_height(current_line_height, fallback_line_height);
@@ -2634,7 +2913,8 @@ fn advance_to_next_line_y(
     let current_page_index = ((current_line_top_y - document_origin_y) / page_stride)
         .floor()
         .max(0.0);
-    let current_page_bottom = current_page_content_bottom(current_line_top_y, document_origin_y);
+    let current_page_bottom =
+        current_page_content_bottom(current_line_top_y, document_origin_y, page_content_height);
 
     if next_line_y + fallback_line_height > current_page_bottom {
         document_origin_y + (current_page_index + 1.0) * page_stride
@@ -2643,12 +2923,16 @@ fn advance_to_next_line_y(
     }
 }
 
-fn current_page_content_bottom(current_y: f32, document_origin_y: f32) -> f32 {
+fn current_page_content_bottom(
+    current_y: f32,
+    document_origin_y: f32,
+    page_content_height: f32,
+) -> f32 {
     let page_stride = A4_PAGE_HEIGHT + PAGE_GAP;
     let current_page_index = ((current_y - document_origin_y) / page_stride)
         .floor()
         .max(0.0);
-    document_origin_y + current_page_index * page_stride + page_text_height(1.0)
+    document_origin_y + current_page_index * page_stride + page_content_height
 }
 
 fn fit_image_size_to_width(image_size: Vec2, max_width: f32) -> Vec2 {
@@ -2745,6 +3029,41 @@ fn hit_test_image_char_index(layout: &LaidOutDocument, pointer_pos: Pos2) -> Opt
                 Some(char_index)
             }
             _ => None,
+        })
+}
+
+fn hit_test_selected_image_resize_handle(
+    state: &RichTextBoxState,
+    layout: &LaidOutDocument,
+    pointer_pos: Pos2,
+) -> Option<ImageResizeHandleHit> {
+    let selected_image_index = state.selected_image_index()?;
+    let selection_range = state.selected_range()?;
+
+    layout
+        .render_boxes
+        .iter()
+        .find_map(|render_box| match render_box.kind {
+            RenderBoxKind::Image {
+                char_index,
+                image_index,
+            } if image_index == selected_image_index && selection_range.contains(&char_index) => {
+                hit_test_image_resize_handle(render_box.visual_rect(), pointer_pos).map(|handle| {
+                    ImageResizeHandleHit {
+                        image_index,
+                        handle,
+                    }
+                })
+            }
+            _ => None,
+        })
+}
+
+fn hit_test_image_resize_handle(image_rect: Rect, pointer_pos: Pos2) -> Option<ImageResizeHandle> {
+    image_resize_handle_points(image_rect)
+        .into_iter()
+        .find_map(|(handle, point)| {
+            (point.distance(pointer_pos) <= IMAGE_SELECTION_HANDLE_HIT_RADIUS).then_some(handle)
         })
 }
 
@@ -2897,6 +3216,50 @@ fn selection_highlight_color() -> Color32 {
     Color32::from_rgba_unmultiplied(140, 194, 255, 166)
 }
 
+fn diagonal_image_resize_size(start_size: Vec2, delta: Vec2, handle: ImageResizeHandle) -> Vec2 {
+    let aspect_ratio = (start_size.x / start_size.y.max(1.0)).max(0.01);
+    let signed_delta_x = match handle {
+        ImageResizeHandle::TopLeft | ImageResizeHandle::BottomLeft => -delta.x,
+        ImageResizeHandle::TopRight | ImageResizeHandle::BottomRight => delta.x,
+        ImageResizeHandle::Left
+        | ImageResizeHandle::Right
+        | ImageResizeHandle::Top
+        | ImageResizeHandle::Bottom => 0.0,
+    };
+    let signed_delta_y = match handle {
+        ImageResizeHandle::TopLeft | ImageResizeHandle::TopRight => -delta.y,
+        ImageResizeHandle::BottomRight | ImageResizeHandle::BottomLeft => delta.y,
+        ImageResizeHandle::Left
+        | ImageResizeHandle::Right
+        | ImageResizeHandle::Top
+        | ImageResizeHandle::Bottom => 0.0,
+    };
+
+    let width_from_x = start_size.x + signed_delta_x;
+    let width_from_y = (start_size.y + signed_delta_y) * aspect_ratio;
+    let new_width = if signed_delta_x.abs() >= signed_delta_y.abs() {
+        width_from_x
+    } else {
+        width_from_y
+    }
+    .max(IMAGE_MIN_SIZE);
+
+    egui::vec2(new_width, (new_width / aspect_ratio).max(IMAGE_MIN_SIZE))
+}
+
+fn image_resize_handle_points(image_rect: Rect) -> [(ImageResizeHandle, Pos2); 8] {
+    [
+        (ImageResizeHandle::TopLeft, image_rect.left_top()),
+        (ImageResizeHandle::Top, image_rect.center_top()),
+        (ImageResizeHandle::TopRight, image_rect.right_top()),
+        (ImageResizeHandle::Right, image_rect.right_center()),
+        (ImageResizeHandle::BottomRight, image_rect.right_bottom()),
+        (ImageResizeHandle::Bottom, image_rect.center_bottom()),
+        (ImageResizeHandle::BottomLeft, image_rect.left_bottom()),
+        (ImageResizeHandle::Left, image_rect.left_center()),
+    ]
+}
+
 fn paint_image_selection_overlay(ui: &Ui, image_rect: Rect) {
     let stroke_color = Color32::from_rgb(20, 120, 220);
     ui.painter().rect_stroke(
@@ -2905,19 +3268,7 @@ fn paint_image_selection_overlay(ui: &Ui, image_rect: Rect) {
         Stroke::new(IMAGE_SELECTION_STROKE_WIDTH, stroke_color),
     );
 
-    let handle_points = [
-        image_rect.left_top(),
-        image_rect.center_top(),
-        image_rect.right_top(),
-        image_rect.right_center(),
-        image_rect.right_bottom(),
-        image_rect.center_bottom(),
-        image_rect.left_bottom(),
-        image_rect.left_center(),
-        image_rect.center(),
-    ];
-
-    for handle_point in handle_points {
+    for (_handle, handle_point) in image_resize_handle_points(image_rect) {
         ui.painter()
             .circle_filled(handle_point, IMAGE_SELECTION_HANDLE_RADIUS, Color32::WHITE);
         ui.painter().circle_stroke(
@@ -2926,6 +3277,17 @@ fn paint_image_selection_overlay(ui: &Ui, image_rect: Rect) {
             Stroke::new(1.4, stroke_color),
         );
     }
+
+    ui.painter().circle_filled(
+        image_rect.center(),
+        IMAGE_SELECTION_HANDLE_RADIUS,
+        Color32::WHITE,
+    );
+    ui.painter().circle_stroke(
+        image_rect.center(),
+        IMAGE_SELECTION_HANDLE_RADIUS,
+        Stroke::new(1.4, stroke_color),
+    );
 }
 
 fn paint_page_backgrounds(ui: &Ui, layout: &LaidOutDocument, canvas_rect: Rect) {
